@@ -11,7 +11,7 @@ import soundfile as sf
 
 
 
-def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon'):
+def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0):
     model.eval()
     
     if dataset_mode == 'raw':
@@ -19,7 +19,7 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
     else:
         shape = (num_samples, 1, 4096)
         
-    z = torch.randn(shape, device=device)
+    z = torch.randn(shape, device=device) * noise_scale
     ts = torch.linspace(0, 1, steps, device=device)
     dt = ts[1] - ts[0]
     
@@ -30,8 +30,8 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
             t = ts[i]
             t_batch = torch.ones(num_samples, device=device) * t
             
-            # Model input t scaled to [0, 1000]
-            model_out = model(z, t_batch * 1000, y)
+            # Model input t in [0, 1] (raw, not scaled)
+            model_out = model(z, t_batch, y)
             
             # Calculate v
             # z_t = t * x + (1-t) * eps
@@ -129,6 +129,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_mode', type=str, default='raw')
     parser.add_argument('--pred_mode', type=str, default='x', choices=['epsilon', 'x', 'v'])
     parser.add_argument('--patch_size', type=int, default=512)
+    parser.add_argument('--noise_scale', type=float, default=1.0, help='Noise scale factor')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     
     args = parser.parse_args()
@@ -156,7 +157,8 @@ if __name__ == "__main__":
     model.load_state_dict(state_dict)
     
     print("Generating samples...")
-    samples = sample(model, args.num_samples, dataset_mode=args.dataset_mode, pred_mode=args.pred_mode, device=args.device)
+    samples = sample(model, args.num_samples, dataset_mode=args.dataset_mode, 
+                    pred_mode=args.pred_mode, noise_scale=args.noise_scale, device=args.device)
     
     save_audio(samples, args.dataset_mode, args.output_dir)
     print(f"Saved to {args.output_dir}")

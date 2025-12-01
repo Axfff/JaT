@@ -199,23 +199,36 @@ def train(args):
             if args.dataset_mode == 'spectrogram':
                 x = x.view(x.shape[0], 1, -1) # [B, 1, 4096]
             
-            # Sample t uniform [0, 1]
-            t = torch.rand(x.shape[0], device=device)
+            # Sample t from logit-normal distribution (JiT-style)
+            # z ~ N(P_mean, P_std), then t = sigmoid(z)
+            # This concentrates samples near 0 and 1
+            z = torch.randn(x.shape[0], device=device) * args.P_std + args.P_mean
+            t = torch.sigmoid(z)
             
             # Forward process
-            noise = torch.randn_like(x)
+            noise = torch.randn_like(x) * args.noise_scale
             z_t, _ = flow.q_sample(x, t, noise)
             
-            # Model prediction
-            model_output = model(z_t, t * 1000, y) # Scale t to [0, 1000] for embedding
+            # Model prediction (pass raw t in [0, 1], not scaled)
+            model_output = model(z_t, t, y)
             
             # Loss
             if args.loss_type == 'epsilon':
                 target = noise
                 loss = F.mse_loss(model_output, target)
             elif args.loss_type == 'x':
-                target = x
-                loss = F.mse_loss(model_output, target)
+                # JiT-style: Model predicts x, but loss is on velocity
+                # v = (x - z_t) / (1 - t)
+                x_pred = model_output
+                
+                # Ground truth velocity
+                v_target = (x - z_t) / (1 - t.view(-1, 1, 1) + 1e-5)
+                
+                # Predicted velocity (derived from predicted x)
+                v_pred = (x_pred - z_t) / (1 - t.view(-1, 1, 1) + 1e-5)
+                
+                # Loss on velocity
+                loss = F.mse_loss(v_pred, v_target)
             elif args.loss_type == 'v':
                 # Plan: v_target = clean_audio - noise
                 # v_pred = (model_output - z_t) / (1 - t)
@@ -281,6 +294,12 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--mock', action='store_true', help='Use mock dataset')
     parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint to resume from')
+    
+    # JiT-style parameters
+    parser.add_argument('--P_mean', type=float, default=-0.8, help='Logit-normal mean for time sampling')
+    parser.add_argument('--P_std', type=float, default=0.8, help='Logit-normal std for time sampling')
+    parser.add_argument('--noise_scale', type=float, default=1.0, help='Noise scale factor')
+    parser.add_argument('--t_eps', type=float, default=5e-2, help='Minimum t value to avoid division by zero')
     
     args = parser.parse_args()
     train(args)

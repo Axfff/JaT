@@ -193,6 +193,12 @@ class SpeechCommandsDataset(Dataset):
             # Log scaling usually helps
             spec = torch.log(spec + 1e-9)
             
+            # Normalize to zero mean and unit variance (approximate based on batch statistics or fixed)
+            # For simplicity and stability, let's just normalize per sample for now, 
+            # or use a fixed global mean/std if known. 
+            # Let's use per-sample standardization.
+            spec = (spec - spec.mean()) / (spec.std() + 1e-5)
+            
             return spec, self.label_to_idx.get(label, 0)
             
         return waveform, self.label_to_idx.get(label, 0)
