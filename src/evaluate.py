@@ -1,0 +1,199 @@
+import os
+import argparse
+import torch
+import torchaudio
+import numpy as np
+from tqdm import tqdm
+from frechet_audio_distance import FrechetAudioDistance
+from model import JustAudioTransformer
+from dataset import get_dataloader
+import soundfile as sf
+
+def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', patch_size=512):
+    model.eval()
+    
+    # Determine shape
+    if dataset_mode == 'raw':
+        shape = (num_samples, 1, 16384)
+    else:
+        # Spectrogram: 64x64 flattened?
+        # In train.py we viewed it as [B, 1, 4096].
+        shape = (num_samples, 1, 4096)
+        
+    # Initial noise z_0
+    z = torch.randn(shape, device=device)
+    
+    # Time steps 0 to 1
+    ts = torch.linspace(0, 1, steps, device=device)
+    dt = 1.0 / (steps - 1)
+    
+    # Class labels (random or specific)
+    # Let's generate random classes
+    y = torch.randint(0, 35, (num_samples,), device=device)
+    
+    traj = []
+    
+    with torch.no_grad():
+        for i in range(steps - 1):
+            t = ts[i] * torch.ones(num_samples, device=device)
+            
+            # Model prediction
+            # Model input expects t in [0, 1000] for embedding?
+            # In train.py: model(z_t, t * 1000, y)
+            model_out = model(z, t * 1000, y)
+            
+            # Calculate velocity v
+            # We need to know if model predicts epsilon or x.
+            # But wait, the sampling formula depends on what the model predicts?
+            # Actually, we can unify it if we know what the model outputs.
+            # But `sample` function doesn't know the training config `loss_type`.
+            # We should pass `pred_mode` ('epsilon', 'x', 'v').
+            
+            # Let's add `pred_mode` argument.
+            # Default to 'epsilon' for now, but we need to match training.
+            pass
+            
+    return z, y
+
+def sample_euler(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon'):
+    model.eval()
+    
+    if dataset_mode == 'raw':
+        shape = (num_samples, 1, 16384)
+    else:
+        shape = (num_samples, 1, 4096)
+        
+    z = torch.randn(shape, device=device)
+    ts = torch.linspace(0, 1, steps, device=device)
+    dt = ts[1] - ts[0]
+    
+    y = torch.randint(0, 35, (num_samples,), device=device)
+    
+    with torch.no_grad():
+        for i in range(steps - 1):
+            t = ts[i]
+            t_batch = torch.ones(num_samples, device=device) * t
+            
+            # Model input t scaled to [0, 1000]
+            model_out = model(z, t_batch * 1000, y)
+            
+            # Calculate v
+            # z_t = t * x + (1-t) * eps
+            # v = x - eps
+            
+            if pred_mode == 'epsilon':
+                eps = model_out
+                # x = (z - (1-t)*eps) / t
+                # This is unstable at t=0.
+                # But we only need v.
+                # v = (z - eps) / t - eps ? No.
+                # v = x - eps.
+                # z = t(x) + (1-t)eps = t(v+eps) + (1-t)eps = tv + eps.
+                # => v = (z - eps) / t.
+                # Still unstable at t=0.
+                
+                # Alternative:
+                # z_{t+dt} = z_t + v * dt
+                # If we use standard DDIM/DDPM sampling, it's different.
+                # But for Flow Matching:
+                # We need v.
+                # If we predict eps, we are essentially predicting the "noise" component.
+                # At t=0, z=eps. So model(z, 0) should predict z.
+                # v = (z - eps) / t is correct for Flow Matching.
+                # We can clip t to avoid division by zero: max(t, 1e-5).
+                
+                v = (z - eps) / torch.maximum(t_batch.view(-1, 1, 1), torch.tensor(1e-5, device=device))
+                
+            elif pred_mode == 'x':
+                x = model_out
+                # v = (x - z) / (1 - t)
+                v = (x - z) / torch.maximum(1 - t_batch.view(-1, 1, 1), torch.tensor(1e-5, device=device))
+                
+            elif pred_mode == 'v':
+                v = model_out
+            
+            z = z + v * dt
+            
+    return z
+
+def save_audio(batch, dataset_mode, output_dir, sample_rate=16000):
+    os.makedirs(output_dir, exist_ok=True)
+    for i, item in enumerate(batch):
+        if dataset_mode == 'spectrogram':
+            # item: [1, 4096] -> [1, 64, 64]
+            spec = item.view(1, 64, 64)
+            # Inverse Mel? Griffin-Lim.
+            # We need to match the MelSpectrogram params from dataset.py
+            # n_fft=1024, hop_length=256, n_mels=64
+            # But we don't have the phase.
+            # Griffin-Lim requires linear spectrogram, not Mel.
+            # So we need InverseMelScale first.
+            
+            # This is complicated. 
+            # For "Control", maybe we just visualize the spectrogram?
+            # Or we try to invert.
+            # Let's try to invert for FAD.
+            
+            inv_mel = torchaudio.transforms.InverseMelScale(n_stft=1024 // 2 + 1, n_mels=64, sample_rate=sample_rate)
+            griffin_lim = torchaudio.transforms.GriffinLim(n_fft=1024, hop_length=256)
+            
+            # spec is log(mel + 1e-9). Inverse log.
+            spec = torch.exp(spec) - 1e-9
+            
+            try:
+                linear_spec = inv_mel(spec)
+                waveform = griffin_lim(linear_spec)
+            except Exception as e:
+                print(f"Griffin-Lim failed: {e}")
+                waveform = torch.zeros(1, 16000)
+                
+        else:
+            waveform = item.cpu()
+            
+        # Normalize
+        waveform = waveform / torch.max(torch.abs(waveform) + 1e-9)
+        
+        # torchaudio.save(os.path.join(output_dir, f"sample_{i}.wav"), waveform, sample_rate, backend="soundfile")
+        # Use soundfile directly
+        # waveform is [1, T] or [T]
+        wav_np = waveform.squeeze().numpy()
+        sf.write(os.path.join(output_dir, f"sample_{i}.wav"), wav_np, sample_rate)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, default='results')
+    parser.add_argument('--num_samples', type=int, default=16)
+    parser.add_argument('--dataset_mode', type=str, default='raw')
+    parser.add_argument('--pred_mode', type=str, default='epsilon')
+    parser.add_argument('--patch_size', type=int, default=512)
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    
+    args = parser.parse_args()
+    
+    # Load Model
+    if args.dataset_mode == 'raw':
+        input_size = 16384
+        in_channels = 1
+    else:
+        input_size = 4096
+        in_channels = 1
+        
+    model = JustAudioTransformer(
+        input_size=input_size,
+        patch_size=args.patch_size,
+        in_channels=in_channels,
+        hidden_size=512,
+        depth=12,
+        num_heads=8,
+        num_classes=35
+    ).to(args.device)
+    
+    state_dict = torch.load(args.checkpoint, map_location=args.device)
+    model.load_state_dict(state_dict)
+    
+    print("Generating samples...")
+    samples = sample_euler(model, args.num_samples, dataset_mode=args.dataset_mode, pred_mode=args.pred_mode, device=args.device)
+    
+    save_audio(samples, args.dataset_mode, args.output_dir)
+    print(f"Saved to {args.output_dir}")

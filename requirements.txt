@@ -1,0 +1,8 @@
+torch
+torchaudio
+numpy
+scipy
+tqdm
+einops
+frechet_audio_distance
+matplotlib
