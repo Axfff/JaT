@@ -105,6 +105,11 @@ class PatchEmbed1D(nn.Module):
 
     def forward(self, x):
         # x: [B, C, T]
+        # Check if padding is needed
+        if x.shape[-1] % self.proj.kernel_size[0] != 0:
+            pad_len = self.proj.kernel_size[0] - (x.shape[-1] % self.proj.kernel_size[0])
+            x = F.pad(x, (0, pad_len))
+            
         x = self.proj(x) # [B, E, L]
         x = x.transpose(1, 2) # [B, L, E]
         return x
@@ -133,7 +138,10 @@ class JustAudioTransformer(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.num_patches = input_size // patch_size
+        
+        # Calculate num_patches
+        # If input_size is not divisible by patch_size, we pad.
+        self.num_patches = (input_size + patch_size - 1) // patch_size
         
         # Input Embedding
         self.x_embedder = PatchEmbed1D(patch_size, in_channels, hidden_size)

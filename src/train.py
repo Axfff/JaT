@@ -104,6 +104,10 @@ class FlowMatching:
             noise = torch.randn_like(x_0)
         
         t_view = t.view(-1, 1, 1)
+        # Flow Matching: z_t = t * x_1 + (1 - t) * x_0
+        # Here x_1 = data (x_0 in our notation), x_0 = noise.
+        # So z_t = t * data + (1 - t) * noise.
+        # This matches the paper's "Optimal Transport" path.
         z_t = t_view * x_0 + (1 - t_view) * noise
         return z_t, noise
 
@@ -268,7 +272,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--experiment_name', type=str, required=True)
     parser.add_argument('--dataset_mode', type=str, default='raw', choices=['raw', 'spectrogram'])
-    parser.add_argument('--loss_type', type=str, default='epsilon', choices=['epsilon', 'x', 'v'])
+    parser.add_argument('--loss_type', type=str, default='x', choices=['epsilon', 'x', 'v'])
     parser.add_argument('--patch_size', type=int, default=512)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=50)

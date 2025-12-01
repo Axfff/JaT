@@ -9,53 +9,9 @@ from model import JustAudioTransformer
 from dataset import get_dataloader
 import soundfile as sf
 
-def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', patch_size=512):
-    model.eval()
-    
-    # Determine shape
-    if dataset_mode == 'raw':
-        shape = (num_samples, 1, 16384)
-    else:
-        # Spectrogram: 64x64 flattened?
-        # In train.py we viewed it as [B, 1, 4096].
-        shape = (num_samples, 1, 4096)
-        
-    # Initial noise z_0
-    z = torch.randn(shape, device=device)
-    
-    # Time steps 0 to 1
-    ts = torch.linspace(0, 1, steps, device=device)
-    dt = 1.0 / (steps - 1)
-    
-    # Class labels (random or specific)
-    # Let's generate random classes
-    y = torch.randint(0, 35, (num_samples,), device=device)
-    
-    traj = []
-    
-    with torch.no_grad():
-        for i in range(steps - 1):
-            t = ts[i] * torch.ones(num_samples, device=device)
-            
-            # Model prediction
-            # Model input expects t in [0, 1000] for embedding?
-            # In train.py: model(z_t, t * 1000, y)
-            model_out = model(z, t * 1000, y)
-            
-            # Calculate velocity v
-            # We need to know if model predicts epsilon or x.
-            # But wait, the sampling formula depends on what the model predicts?
-            # Actually, we can unify it if we know what the model outputs.
-            # But `sample` function doesn't know the training config `loss_type`.
-            # We should pass `pred_mode` ('epsilon', 'x', 'v').
-            
-            # Let's add `pred_mode` argument.
-            # Default to 'epsilon' for now, but we need to match training.
-            pass
-            
-    return z, y
 
-def sample_euler(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon'):
+
+def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon'):
     model.eval()
     
     if dataset_mode == 'raw':
@@ -106,10 +62,15 @@ def sample_euler(model, num_samples, steps=50, device='cuda', dataset_mode='raw'
                 
             elif pred_mode == 'x':
                 x = model_out
-                # v = (x - z) / (1 - t)
+                # v = (x - z_t) / (1 - t)
+                # Note: t is in [0, 1].
+                # At t=1, 1-t=0. We need to clip.
                 v = (x - z) / torch.maximum(1 - t_batch.view(-1, 1, 1), torch.tensor(1e-5, device=device))
                 
             elif pred_mode == 'v':
+                # WARNING: This assumes model outputs v directly.
+                # If trained with loss_type='v' in train.py, the model actually predicts x!
+                # Use pred_mode='x' for models trained with loss_type='v'.
                 v = model_out
             
             z = z + v * dt
@@ -166,10 +127,11 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, default='results')
     parser.add_argument('--num_samples', type=int, default=16)
     parser.add_argument('--dataset_mode', type=str, default='raw')
-    parser.add_argument('--pred_mode', type=str, default='epsilon')
+    parser.add_argument('--pred_mode', type=str, default='x', choices=['epsilon', 'x', 'v'])
     parser.add_argument('--patch_size', type=int, default=512)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     
+    args = parser.parse_args()
     args = parser.parse_args()
     
     # Load Model
@@ -194,7 +156,7 @@ if __name__ == "__main__":
     model.load_state_dict(state_dict)
     
     print("Generating samples...")
-    samples = sample_euler(model, args.num_samples, dataset_mode=args.dataset_mode, pred_mode=args.pred_mode, device=args.device)
+    samples = sample(model, args.num_samples, dataset_mode=args.dataset_mode, pred_mode=args.pred_mode, device=args.device)
     
     save_audio(samples, args.dataset_mode, args.output_dir)
     print(f"Saved to {args.output_dir}")
