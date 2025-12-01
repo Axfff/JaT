@@ -139,6 +139,7 @@ def save_audio(batch, dataset_mode, output_dir, sample_rate=16000):
             
             # spec is log(mel + 1e-9). Inverse log.
             spec = torch.exp(spec) - 1e-9
+            spec = spec.cpu()
             
             try:
                 linear_spec = inv_mel(spec)
