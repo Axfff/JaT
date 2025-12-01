@@ -58,7 +58,10 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
                 # v = (z - eps) / t is correct for Flow Matching.
                 # We can clip t to avoid division by zero: max(t, 1e-5).
                 
-                v = (z - eps) / torch.maximum(t_batch.view(-1, 1, 1), torch.tensor(1e-5, device=device))
+                # Use a larger epsilon for stability or conditional check
+                # At t=0, v is undefined if we just divide. 
+                # But we can assume v is large or just clamp t.
+                v = (z - eps) / torch.maximum(t_batch.view(-1, 1, 1), torch.tensor(1e-3, device=device))
                 
             elif pred_mode == 'x':
                 x = model_out
@@ -131,8 +134,9 @@ if __name__ == "__main__":
     parser.add_argument('--patch_size', type=int, default=512)
     parser.add_argument('--noise_scale', type=float, default=1.0, help='Noise scale factor')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--hidden_size', type=int, default=512, help='Model hidden size')
+    parser.add_argument('--depth', type=int, default=12, help='Model depth')
     
-    args = parser.parse_args()
     args = parser.parse_args()
     
     # Load Model
@@ -147,8 +151,8 @@ if __name__ == "__main__":
         input_size=input_size,
         patch_size=args.patch_size,
         in_channels=in_channels,
-        hidden_size=512,
-        depth=12,
+        hidden_size=args.hidden_size,
+        depth=args.depth,
         num_heads=8,
         num_classes=35
     ).to(args.device)

@@ -155,8 +155,8 @@ def train(args):
         input_size=input_size,
         patch_size=args.patch_size,
         in_channels=in_channels,
-        hidden_size=512,
-        depth=12,
+        hidden_size=args.hidden_size,
+        depth=args.depth,
         num_heads=8,
         num_classes=35 # SpeechCommands v2 has 35 words
     ).to(device)
@@ -189,9 +189,16 @@ def train(args):
         except:
             print("Could not parse epoch from checkpoint name, starting from next epoch if possible or 0")
             
+    # Logging
+    log_file = os.path.join('checkpoints', f'training_log_{args.experiment_name}.csv')
+    with open(log_file, 'w') as f:
+        f.write('epoch,step,loss\n')
+            
     for epoch in range(start_epoch, args.epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        for x, y in pbar:
+        epoch_loss = 0.0
+        steps = 0
+        for i, (x, y) in enumerate(pbar):
             x = x.to(device)
             y = y.to(device)
             
@@ -275,6 +282,12 @@ def train(args):
             optimizer.step()
             
             pbar.set_postfix({'loss': loss.item()})
+            epoch_loss += loss.item()
+            steps += 1
+            
+            # Log step loss
+            with open(log_file, 'a') as f:
+                f.write(f'{epoch},{i},{loss.item()}\n')
             
         # Save checkpoint
         if (epoch + 1) % 10 == 0 or epoch == 0:
@@ -294,6 +307,10 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--mock', action='store_true', help='Use mock dataset')
     parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint to resume from')
+    
+    # Model Capacity
+    parser.add_argument('--hidden_size', type=int, default=512, help='Model hidden size')
+    parser.add_argument('--depth', type=int, default=12, help='Model depth (number of layers)')
     
     # JiT-style parameters
     parser.add_argument('--P_mean', type=float, default=-0.8, help='Logit-normal mean for time sampling')
