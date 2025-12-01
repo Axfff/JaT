@@ -131,7 +131,7 @@ def load_groundtruth(data_root, num_samples, dataset_mode='raw', subset='testing
     return gt_data, gt_labels
 
 
-def visualize_comparison(predictions, groundtruth, save_path, dataset_mode='raw', num_display=8):
+def visualize_comparison(predictions, groundtruth, save_path, pred_is_waveform=True, gt_is_waveform=True, num_display=8):
     """
     Visualize predicted vs groundtruth spectrograms.
     
@@ -139,7 +139,8 @@ def visualize_comparison(predictions, groundtruth, save_path, dataset_mode='raw'
         predictions: predicted data (waveforms or spectrograms)
         groundtruth: groundtruth data (waveforms or spectrograms)
         save_path: path to save the visualization
-        dataset_mode: 'raw' or 'spectrogram'
+        pred_is_waveform: whether predictions are waveforms (True) or spectrograms (False)
+        gt_is_waveform: whether groundtruth are waveforms (True) or spectrograms (False)
         num_display: number of samples to display
     """
     num_display = min(num_display, len(predictions), len(groundtruth))
@@ -150,7 +151,7 @@ def visualize_comparison(predictions, groundtruth, save_path, dataset_mode='raw'
     
     for i in range(num_display):
         # Process predictions
-        if dataset_mode == 'raw':
+        if pred_is_waveform:
             # predictions are waveforms, convert to spectrogram
             pred_spec = waveform_to_spectrogram(predictions[i].cpu())
         else:
@@ -159,7 +160,7 @@ def visualize_comparison(predictions, groundtruth, save_path, dataset_mode='raw'
         pred_specs.append(pred_spec)
         
         # Process groundtruth
-        if dataset_mode == 'raw':
+        if gt_is_waveform:
             # groundtruth are waveforms, convert to spectrogram
             gt_spec = waveform_to_spectrogram(groundtruth[i])
         else:
@@ -215,8 +216,10 @@ def visualize_comparison(predictions, groundtruth, save_path, dataset_mode='raw'
         ax_diff.set_xlabel('Time')
         plt.colorbar(im_diff, ax=ax_diff)
     
+    pred_src = "Waveform" if pred_is_waveform else "Spectrogram"
+    gt_src = "Waveform" if gt_is_waveform else "Spectrogram"
     plt.suptitle(
-        f'Spectrum Comparison: Predicted vs Groundtruth ({dataset_mode} mode)', 
+        f'Spectrum Comparison (Pred: {pred_src} | GT: {gt_src})', 
         fontsize=16, 
         y=0.995
     )
@@ -225,14 +228,15 @@ def visualize_comparison(predictions, groundtruth, save_path, dataset_mode='raw'
     plt.close()
 
 
-def compute_metrics(predictions, groundtruth, dataset_mode='raw'):
+def compute_metrics(predictions, groundtruth, pred_is_waveform=True, gt_is_waveform=True):
     """
     Compute quantitative metrics comparing predictions and groundtruth.
     
     Args:
         predictions: predicted data
         groundtruth: groundtruth data
-        dataset_mode: 'raw' or 'spectrogram'
+        pred_is_waveform: whether predictions are waveforms (True) or spectrograms (False)
+        gt_is_waveform: whether groundtruth are waveforms (True) or spectrograms (False)
         
     Returns:
         metrics: dictionary of metrics
@@ -246,11 +250,14 @@ def compute_metrics(predictions, groundtruth, dataset_mode='raw'):
     num_samples = min(len(predictions), len(groundtruth))
     
     for i in range(num_samples):
-        if dataset_mode == 'raw':
+        if pred_is_waveform:
             pred_spec = waveform_to_spectrogram(predictions[i].cpu())
-            gt_spec = waveform_to_spectrogram(groundtruth[i])
         else:
             pred_spec = predictions[i].cpu().view(64, 64)
+            
+        if gt_is_waveform:
+            gt_spec = waveform_to_spectrogram(groundtruth[i])
+        else:
             gt_spec = groundtruth[i].view(64, 64)
         
         pred_specs.append(pred_spec)
@@ -287,8 +294,8 @@ def compute_metrics(predictions, groundtruth, dataset_mode='raw'):
 
 def main():
     parser = argparse.ArgumentParser(description='Visualize predicted spectrum vs groundtruth')
-    parser.add_argument('--checkpoint', type=str, required=True, 
-                        help='Path to model checkpoint')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to model checkpoint (required if not using --use_predictions)')
     parser.add_argument('--data_root', type=str, default='./data',
                         help='Root directory for dataset')
     parser.add_argument('--dataset_mode', type=str, default='raw', 
@@ -314,9 +321,14 @@ def main():
     
     args = parser.parse_args()
     
+    # Validation: need either checkpoint or use_predictions
+    if not args.checkpoint and not args.use_predictions:
+        parser.error("Either --checkpoint or --use_predictions must be provided")
+    
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Load or generate predictions
+    pred_is_waveform = True  # Default assumption
     if args.use_predictions:
         print(f"Loading predictions from {args.use_predictions}")
         predictions = []
@@ -330,6 +342,8 @@ def main():
             if waveform.ndim == 1:
                 waveform = waveform.unsqueeze(0)
             predictions.append(waveform)
+        # When loading from audio files, predictions are always waveforms
+        pred_is_waveform = True
     else:
         # Generate predictions using model
         predictions = load_model_predictions(
@@ -340,6 +354,8 @@ def main():
             args.device
         )
         predictions = [predictions[i] for i in range(len(predictions))]
+        # Model predictions match the dataset_mode
+        pred_is_waveform = (args.dataset_mode == 'raw')
     
     # Load groundtruth
     groundtruth, labels = load_groundtruth(
@@ -348,6 +364,8 @@ def main():
         dataset_mode=args.dataset_mode,
         subset=args.subset
     )
+    # Groundtruth format matches the dataset_mode
+    gt_is_waveform = (args.dataset_mode == 'raw')
     
     # Ensure same number of samples
     num_samples = min(len(predictions), len(groundtruth))
@@ -355,10 +373,12 @@ def main():
     groundtruth = groundtruth[:num_samples]
     
     print(f"\nComparing {num_samples} samples...")
+    print(f"Predictions are: {'waveforms' if pred_is_waveform else 'spectrograms'}")
+    print(f"Groundtruth are: {'waveforms' if gt_is_waveform else 'spectrograms'}")
     
     # Compute metrics
     print("\nComputing metrics...")
-    metrics = compute_metrics(predictions, groundtruth, args.dataset_mode)
+    metrics = compute_metrics(predictions, groundtruth, pred_is_waveform, gt_is_waveform)
     
     print("\n" + "="*50)
     print("METRICS:")
@@ -372,10 +392,13 @@ def main():
     with open(metrics_path, 'w') as f:
         f.write("Spectrum Comparison Metrics\n")
         f.write("="*50 + "\n")
-        f.write(f"Checkpoint: {args.checkpoint}\n")
+        f.write(f"Checkpoint: {args.checkpoint if args.checkpoint else 'N/A (using pre-generated)'}\n")
+        f.write(f"Predictions: {args.use_predictions if args.use_predictions else 'Generated from model'}\n")
         f.write(f"Dataset Mode: {args.dataset_mode}\n")
-        f.write(f"Prediction Mode: {args.pred_mode}\n")
+        f.write(f"Prediction Mode: {args.pred_mode if not args.use_predictions else 'N/A'}\n")
         f.write(f"Number of Samples: {num_samples}\n")
+        f.write(f"Prediction Format: {'waveform' if pred_is_waveform else 'spectrogram'}\n")
+        f.write(f"Groundtruth Format: {'waveform' if gt_is_waveform else 'spectrogram'}\n")
         f.write("="*50 + "\n")
         for metric_name, value in metrics.items():
             f.write(f"{metric_name:25s}: {value:.6f}\n")
@@ -388,7 +411,8 @@ def main():
         predictions, 
         groundtruth, 
         viz_path, 
-        args.dataset_mode, 
+        pred_is_waveform,
+        gt_is_waveform,
         args.num_display
     )
     
