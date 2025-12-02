@@ -155,7 +155,7 @@ def train(args):
         num_heads=8, # Fixed or arg?
         num_classes=35,
         mlp_ratio=4.0,
-        bottleneck_dim=128, # Default
+        bottleneck_dim=args.hidden_size, # Default
         in_context_len=0, # Disable in-context for now unless specified
     ).to(device)
     
