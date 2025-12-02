@@ -131,9 +131,8 @@ def train(args):
     print(f"Creating model: Patch={args.patch_size}, Loss={args.loss_type}")
     # Determine input channels and size based on mode
     if args.dataset_mode == 'raw':
-        # Raw audio not fully supported yet with JiT (needs 2D reshaping)
-        # For now, let's assume we might use it but it will likely fail or need reshaping
-        input_size = 128 # Dummy
+        # Raw audio input size is 16384 (1 second at 16kHz usually, or defined by dataset)
+        input_size = 16384 
         in_channels = 1
         patch_size = args.patch_size
     else: # spectrogram
