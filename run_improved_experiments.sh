@@ -15,9 +15,10 @@ run_experiment() {
     local dataset_mode=$2
     local pred_mode=$3
     local patch_size=$4
+    local device=$5
     
     echo "=================================================="
-    echo "Starting Experiment: $exp_name"
+    echo "Starting Experiment: $exp_name on $device"
     echo "Dataset: $dataset_mode | Prediction: $pred_mode"
     echo "=================================================="
     
@@ -30,7 +31,8 @@ run_experiment() {
         --hidden_size "$HIDDEN_SIZE" \
         --depth "$DEPTH" \
         --batch_size "$BATCH_SIZE" \
-        --noise_scale "$NOISE_SCALE"
+        --noise_scale "$NOISE_SCALE" \
+        --device "$device"
         
     # Evaluate
     echo "Evaluating $exp_name..."
@@ -45,7 +47,8 @@ run_experiment() {
         --hidden_size "$HIDDEN_SIZE" \
         --depth "$DEPTH" \
         --bottleneck_dim "$HIDDEN_SIZE" \
-        --in_context_len 0
+        --in_context_len 0 \
+        --device "$device"
         
     # Visualize
     echo "Visualizing $exp_name..."
@@ -57,29 +60,40 @@ run_experiment() {
         --num_samples 16 \
         --num_display 8 \
         --output_dir "spectrum_comparisons/${exp_name}" \
-        --subset testing
+        --subset testing \
+        --device "$device"
         
     echo "Finished $exp_name"
 }
 
-# 0. Control: Spectrogram + Epsilon_eps
-run_experiment "improved_spec_eps" "spectrogram" "epsilon_epsilon_loss" 8
+# GPU 0 Experiments
+(
+    # 0. Control: Spectrogram + Epsilon_eps
+    run_experiment "improved_spec_eps" "spectrogram" "epsilon_epsilon_loss" 8 "cuda:0"
 
-# 1. Control: Spectrogram + Velocity_v
-run_experiment "improved_spec_eps" "spectrogram" "v_v_loss" 8
+    # 2. Test: Spectrogram + X_v
+    run_experiment "improved_spec_x" "spectrogram" "x_v_loss" 8 "cuda:0"
 
-# 2. Test: Spectrogram + X_v
-run_experiment "improved_spec_x" "spectrogram" "x_v_loss" 8
+    # 4. Main: Raw + X_v
+    run_experiment "improved_raw_x" "raw" "x_v_loss" 64 "cuda:0"
+    
+    # 6. Extra: Raw + X_v (Large Patch)
+    run_experiment "improved_raw_x_250" "raw" "x_v_loss" 250 "cuda:0"
+) &
 
-# 3. Baseline: Raw + Velocity_v
-run_experiment "improved_raw_eps" "raw" "v_v_loss" 64
+# GPU 1 Experiments
+(
+    # 1. Control: Spectrogram + Velocity_v (Renamed from improved_spec_eps)
+    run_experiment "improved_spec_v" "spectrogram" "v_v_loss" 8 "cuda:1"
 
-# 4. Main: Raw + X_v
-run_experiment "improved_raw_x" "raw" "x_v_loss" 64
+    # 3. Baseline: Raw + Velocity_v
+    run_experiment "improved_raw_eps" "raw" "v_v_loss" 64 "cuda:1"
+    
+    # 5. Extra: Raw + Velocity_v (Large Patch)
+    run_experiment "improved_raw_eps_250" "raw" "v_v_loss" 250 "cuda:1"
+) &
 
-run_experiment "improved_raw_eps_250" "raw" "v_v_loss" 250  # large patch size but same patch count
-
-run_experiment "improved_raw_x_250" "raw" "x_v_loss" 250
+wait
 
 echo "=================================================="
 echo "All improved experiments completed!"
