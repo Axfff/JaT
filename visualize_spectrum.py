@@ -8,7 +8,9 @@ from matplotlib.gridspec import GridSpec
 import soundfile as sf
 from tqdm import tqdm
 
-from src.model import JustAudioTransformer
+import sys
+sys.path.append('src')
+from src.model import JiT
 from src.dataset import get_dataloader, SpeechCommandsDataset
 
 
@@ -70,17 +72,20 @@ def load_model_predictions(checkpoint_path, dataset_mode, pred_mode, num_samples
         input_size = 16384
         in_channels = 1
     else:
-        input_size = 4096
+        input_size = 64
         in_channels = 1
         
-    model = JustAudioTransformer(
+    model = JiT(
         input_size=input_size,
         patch_size=512,
         in_channels=in_channels,
         hidden_size=512,
         depth=12,
         num_heads=8,
-        num_classes=35
+        num_classes=35,
+        bottleneck_dim=512, # Default matching hidden_size
+        in_context_len=0,   # Default 0
+        is_1d=(dataset_mode == 'raw')
     ).to(device)
     
     state_dict = torch.load(checkpoint_path, map_location=device)

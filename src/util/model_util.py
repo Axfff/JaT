@@ -94,7 +94,8 @@ class VisionRotaryEmbeddingFast(nn.Module):
         theta = 10000,
         max_freq = 10,
         num_freqs = 1,
-        num_cls_token = 0
+        num_cls_token = 0,
+        is_1d = False
     ):
         super().__init__()
         if custom_freqs:
@@ -113,7 +114,11 @@ class VisionRotaryEmbeddingFast(nn.Module):
 
         freqs = torch.einsum('..., f -> ... f', t, freqs)
         freqs = repeat(freqs, '... n -> ... (n r)', r = 2)
-        freqs = broadcat((freqs[:, None, :], freqs[None, :, :]), dim = -1)
+        
+        if is_1d:
+            freqs = torch.cat([freqs, freqs], dim=-1)
+        else:
+            freqs = broadcat((freqs[:, None, :], freqs[None, :, :]), dim = -1)
 
         if num_cls_token > 0:
             freqs_flat = freqs.view(-1, freqs.shape[-1])  # [N_img, D]

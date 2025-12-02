@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
-from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
+import numpy as np
+from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, get_1d_sincos_pos_embed_from_grid, RMSNorm
 
 
 def modulate(x, shift, scale):
@@ -17,23 +18,36 @@ def modulate(x, shift, scale):
 class BottleneckPatchEmbed(nn.Module):
     """ Image to Patch Embedding
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True, is_1d=False):
         super().__init__()
-        img_size = (img_size, img_size)
-        patch_size = (patch_size, patch_size)
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = num_patches
+        self.is_1d = is_1d
+        if is_1d:
+            self.img_size = img_size # int
+            self.patch_size = patch_size # int
+            self.num_patches = img_size // patch_size
+            self.proj1 = nn.Conv1d(in_chans, pca_dim, kernel_size=patch_size, stride=patch_size, bias=False)
+            self.proj2 = nn.Conv1d(pca_dim, embed_dim, kernel_size=1, stride=1, bias=bias)
+        else:
+            img_size = (img_size, img_size)
+            patch_size = (patch_size, patch_size)
+            num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
+            self.img_size = img_size
+            self.patch_size = patch_size
+            self.num_patches = num_patches
 
-        self.proj1 = nn.Conv2d(in_chans, pca_dim, kernel_size=patch_size, stride=patch_size, bias=False)
-        self.proj2 = nn.Conv2d(pca_dim, embed_dim, kernel_size=1, stride=1, bias=bias)
+            self.proj1 = nn.Conv2d(in_chans, pca_dim, kernel_size=patch_size, stride=patch_size, bias=False)
+            self.proj2 = nn.Conv2d(pca_dim, embed_dim, kernel_size=1, stride=1, bias=bias)
 
     def forward(self, x):
-        B, C, H, W = x.shape
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj2(self.proj1(x)).flatten(2).transpose(1, 2)
+        if self.is_1d:
+            B, C, L = x.shape
+            assert L == self.img_size, f"Input size {L} doesn't match model {self.img_size}."
+            x = self.proj2(self.proj1(x)).transpose(1, 2)
+        else:
+            B, C, H, W = x.shape
+            assert H == self.img_size[0] and W == self.img_size[1], \
+                f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+            x = self.proj2(self.proj1(x)).flatten(2).transpose(1, 2)
         return x
 
 
@@ -164,10 +178,11 @@ class FinalLayer(nn.Module):
     """
     The final layer of JiT.
     """
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, is_1d=False):
         super().__init__()
         self.norm_final = RMSNorm(hidden_size)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        out_dim = patch_size * out_channels if is_1d else patch_size * patch_size * out_channels
+        self.linear = nn.Linear(hidden_size, out_dim, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
@@ -221,9 +236,11 @@ class JiT(nn.Module):
         num_classes=1000,
         bottleneck_dim=128,
         in_context_len=32,
-        in_context_start=8
+        in_context_start=8,
+        is_1d=False
     ):
         super().__init__()
+        self.is_1d = is_1d
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.patch_size = patch_size
@@ -239,7 +256,7 @@ class JiT(nn.Module):
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
 
         # linear embed
-        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
+        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True, is_1d=is_1d)
 
         # use fixed sin-cos embedding
         num_patches = self.x_embedder.num_patches
@@ -252,16 +269,22 @@ class JiT(nn.Module):
 
         # rope
         half_head_dim = hidden_size // num_heads // 2
-        hw_seq_len = input_size // patch_size
+        if is_1d:
+            hw_seq_len = num_patches
+        else:
+            hw_seq_len = input_size // patch_size
+            
         self.feat_rope = VisionRotaryEmbeddingFast(
             dim=half_head_dim,
             pt_seq_len=hw_seq_len,
-            num_cls_token=0
+            num_cls_token=0,
+            is_1d=is_1d
         )
         self.feat_rope_incontext = VisionRotaryEmbeddingFast(
             dim=half_head_dim,
             pt_seq_len=hw_seq_len,
-            num_cls_token=self.in_context_len
+            num_cls_token=self.in_context_len,
+            is_1d=is_1d
         )
 
         # transformer
@@ -273,7 +296,7 @@ class JiT(nn.Module):
         ])
 
         # linear predict
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, is_1d=is_1d)
 
         self.initialize_weights()
 
@@ -287,7 +310,10 @@ class JiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        if self.is_1d:
+            pos_embed = get_1d_sincos_pos_embed_from_grid(self.pos_embed.shape[-1], np.arange(self.x_embedder.num_patches, dtype=np.float32))
+        else:
+            pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
@@ -317,17 +343,27 @@ class JiT(nn.Module):
 
     def unpatchify(self, x, p):
         """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
+        x: (N, T, patch_size**2 * C) or (N, T, patch_size * C)
+        imgs: (N, H, W, C) or (N, 1, L)
         """
         c = self.out_channels
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
+        
+        if self.is_1d:
+            # x: [N, T, p*c]
+            # output: [N, 1, L]
+            # reshape to [N, T, p, c] -> [N, c, T, p] -> [N, c, L]
+            x = x.reshape(shape=(x.shape[0], x.shape[1], p, c))
+            x = torch.einsum('ntpc->nctp', x)
+            imgs = x.reshape(shape=(x.shape[0], c, x.shape[2] * p))
+            return imgs
+        else:
+            h = w = int(x.shape[1] ** 0.5)
+            assert h * w == x.shape[1]
 
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
+            x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+            x = torch.einsum('nhwpqc->nchpwq', x)
+            imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+            return imgs
 
     def forward(self, x, t, y):
         """

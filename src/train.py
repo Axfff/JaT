@@ -157,6 +157,7 @@ def train(args):
         mlp_ratio=4.0,
         bottleneck_dim=args.hidden_size, # Default
         in_context_len=0, # Disable in-context for now unless specified
+        is_1d=(args.dataset_mode == 'raw')
     ).to(device)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)

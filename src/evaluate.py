@@ -5,7 +5,9 @@ import torchaudio
 import numpy as np
 from tqdm import tqdm
 from frechet_audio_distance import FrechetAudioDistance
-from model import JustAudioTransformer
+from frechet_audio_distance import FrechetAudioDistance
+from model import JiT
+from dataset import get_dataloader
 from dataset import get_dataloader
 import soundfile as sf
 
@@ -17,7 +19,7 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
     if dataset_mode == 'raw':
         shape = (num_samples, 1, 16384)
     else:
-        shape = (num_samples, 1, 4096)
+        shape = (num_samples, 1, 64, 64)
         
     z = torch.randn(shape, device=device) * noise_scale
     ts = torch.linspace(0, 1, steps, device=device)
@@ -136,6 +138,8 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--hidden_size', type=int, default=512, help='Model hidden size')
     parser.add_argument('--depth', type=int, default=12, help='Model depth')
+    parser.add_argument('--bottleneck_dim', type=int, default=None, help='Bottleneck dimension (default: hidden_size)')
+    parser.add_argument('--in_context_len', type=int, default=0, help='In-context length')
     
     args = parser.parse_args()
     
@@ -144,17 +148,22 @@ if __name__ == "__main__":
         input_size = 16384
         in_channels = 1
     else:
-        input_size = 4096
+        input_size = 64
         in_channels = 1
         
-    model = JustAudioTransformer(
+    bottleneck_dim = args.bottleneck_dim if args.bottleneck_dim is not None else args.hidden_size
+
+    model = JiT(
         input_size=input_size,
         patch_size=args.patch_size,
         in_channels=in_channels,
         hidden_size=args.hidden_size,
         depth=args.depth,
         num_heads=8,
-        num_classes=35
+        num_classes=35,
+        bottleneck_dim=bottleneck_dim,
+        in_context_len=args.in_context_len,
+        is_1d=(args.dataset_mode == 'raw')
     ).to(args.device)
     
     state_dict = torch.load(args.checkpoint, map_location=args.device)

@@ -1,6 +1,8 @@
 import torch
 import os
-from src.model import JustAudioTransformer
+import sys
+sys.path.append('src')
+from src.model import JiT
 
 os.makedirs('checkpoints', exist_ok=True)
 
@@ -17,17 +19,25 @@ for name, mode, loss in configs:
         input_size = 16384
         in_channels = 1
     else:
-        input_size = 4096
+        input_size = 64
         in_channels = 1
         
-    model = JustAudioTransformer(
+    if mode == 'raw':
+        patch_size = 512
+    else:
+        patch_size = 8
+
+    model = JiT(
         input_size=input_size,
-        patch_size=512,
+        patch_size=patch_size,
         in_channels=in_channels,
         hidden_size=512,
         depth=12,
         num_heads=8,
-        num_classes=35
+        num_classes=35,
+        bottleneck_dim=512,
+        in_context_len=0,
+        is_1d=(mode == 'raw')
     )
     
     path = f'checkpoints/model_{name}_ep50.pth'

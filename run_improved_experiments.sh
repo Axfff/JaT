@@ -4,8 +4,8 @@
 # Common Configuration: Hidden=768, Depth=16, Epochs=100
 
 EPOCHS=100
-HIDDEN_SIZE=768
-DEPTH=16
+HIDDEN_SIZE=64
+DEPTH=12
 BATCH_SIZE=32
 NOISE_SCALE=1.0
 
@@ -14,6 +14,7 @@ run_experiment() {
     local exp_name=$1
     local dataset_mode=$2
     local pred_mode=$3
+    local patch_size=$4
     
     echo "=================================================="
     echo "Starting Experiment: $exp_name"
@@ -40,9 +41,11 @@ run_experiment() {
         --output_dir "results/${exp_name}" \
         --pred_mode "$pred_mode" \
         --noise_scale "$NOISE_SCALE" \
-        --patch_size 512 \
+        --patch_size "$patch_size" \
         --hidden_size "$HIDDEN_SIZE" \
-        --depth "$DEPTH"
+        --depth "$DEPTH" \
+        --bottleneck_dim "$HIDDEN_SIZE" \
+        --in_context_len 0
         
     # Visualize
     echo "Visualizing $exp_name..."
@@ -59,17 +62,24 @@ run_experiment() {
     echo "Finished $exp_name"
 }
 
-# 1. Control: Spectrogram + Epsilon
-run_experiment "improved_spec_eps" "spectrogram" "epsilon"
+# 0. Control: Spectrogram + Epsilon_eps
+run_experiment "improved_spec_eps" "spectrogram" "epsilon_epsilon_loss" 8
 
-# 2. Test: Spectrogram + X
-run_experiment "improved_spec_x" "spectrogram" "x"
+# 1. Control: Spectrogram + Velocity_v
+run_experiment "improved_spec_eps" "spectrogram" "v_v_loss" 8
 
-# 3. Baseline: Raw + Epsilon
-run_experiment "improved_raw_eps" "raw" "epsilon"
+# 2. Test: Spectrogram + X_v
+run_experiment "improved_spec_x" "spectrogram" "x_v_loss" 8
 
-# 4. Main: Raw + X
-run_experiment "improved_raw_x" "raw" "x"
+# 3. Baseline: Raw + Velocity_v
+run_experiment "improved_raw_eps" "raw" "v_v_loss" 64
+
+# 4. Main: Raw + X_v
+run_experiment "improved_raw_x" "raw" "x_v_loss" 64
+
+run_experiment "improved_raw_eps_250" "raw" "v_v_loss" 250  # large patch size but same patch count
+
+run_experiment "improved_raw_x_250" "raw" "x_v_loss" 250
 
 echo "=================================================="
 echo "All improved experiments completed!"
