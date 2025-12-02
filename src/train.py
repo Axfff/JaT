@@ -9,7 +9,7 @@ from tqdm import tqdm
 import numpy as np
 
 from dataset import get_dataloader
-from model import JustAudioTransformer
+from model import JiT, JiT_models
 
 # --- Noise Scheduler ---
 def get_beta_schedule(num_timesteps, beta_start=0.0001, beta_end=0.02):
@@ -103,7 +103,10 @@ class FlowMatching:
         if noise is None:
             noise = torch.randn_like(x_0)
         
-        t_view = t.view(-1, 1, 1)
+        # Reshape t to [B, 1, 1, ...] matching x_0
+        # t is [B]
+        view_shape = [t.shape[0]] + [1] * (x_0.dim() - 1)
+        t_view = t.view(*view_shape)
         # Flow Matching: z_t = t * x_1 + (1 - t) * x_0
         # Here x_1 = data (x_0 in our notation), x_0 = noise.
         # So z_t = t * data + (1 - t) * noise.
@@ -128,37 +131,32 @@ def train(args):
     print(f"Creating model: Patch={args.patch_size}, Loss={args.loss_type}")
     # Determine input channels and size based on mode
     if args.dataset_mode == 'raw':
-        input_size = 16384
+        # Raw audio not fully supported yet with JiT (needs 2D reshaping)
+        # For now, let's assume we might use it but it will likely fail or need reshaping
+        input_size = 128 # Dummy
         in_channels = 1
+        patch_size = args.patch_size
     else: # spectrogram
-        input_size = 64 # We treat 64x64 as sequence length 64, channels 64? 
-        # Or flatten?
-        # DiT usually takes (N, C, H, W) -> Patchify -> (N, T, D).
-        # Our model is 1D.
-        # If spectrogram is 64x64.
-        # Option 1: Treat as 1 channel, 4096 length.
-        # Option 2: Treat as 64 channels, 64 length.
-        # Plan says: "Spectrogram ... 64x64".
-        # Plan says: "Config A ... Patch=512", "Config B ... Patch=64".
-        # If we use 1D model on 2D data, we should flatten or treat one dim as channels.
-        # Let's treat it as 1 channel, flattened 4096?
-        # Or 64 channels, length 64?
-        # The plan says "Input ... shape [batch, 1, 16000]".
-        # For spectrogram, it says "Control: Spectrogram Input".
-        # Let's assume we flatten it to [B, 1, 4096] or similar.
-        # 64x64 = 4096.
-        # If patch_size=64, we get 64 tokens.
-        input_size = 4096
+        # JiT expects square image input.
+        # Our spectrogram is 64x64.
+        input_size = 64
         in_channels = 1
-    
-    model = JustAudioTransformer(
+        patch_size = args.patch_size # e.g. 16 or 8
+
+    # Instantiate JiT
+    # We can use the helper functions if args match, or direct instantiation
+    # Let's use direct instantiation to be safe with args
+    model = JiT(
         input_size=input_size,
-        patch_size=args.patch_size,
+        patch_size=patch_size,
         in_channels=in_channels,
         hidden_size=args.hidden_size,
         depth=args.depth,
-        num_heads=8,
-        num_classes=35 # SpeechCommands v2 has 35 words
+        num_heads=8, # Fixed or arg?
+        num_classes=35,
+        mlp_ratio=4.0,
+        bottleneck_dim=128, # Default
+        in_context_len=0, # Disable in-context for now unless specified
     ).to(device)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
@@ -203,8 +201,17 @@ def train(args):
             y = y.to(device)
             
             # If spectrogram, flatten
+            # If spectrogram, ensure [B, 1, 64, 64]
             if args.dataset_mode == 'spectrogram':
-                x = x.view(x.shape[0], 1, -1) # [B, 1, 4096]
+                if x.dim() == 3: # [B, 64, 64] -> [B, 1, 64, 64]
+                    x = x.unsqueeze(1)
+                # If flattened, reshape? Dataset returns [64, 64] usually (after squeeze)
+                # Dataset code: returns spec [64, 64] (if squeezed) or [1, 64, 64]
+                # Let's check dataset.py again. It returns `spec` which is [64, 64] after squeeze.
+                # So x is [B, 64, 64].
+                # We need [B, 1, 64, 64].
+                if x.dim() == 3:
+                    x = x.unsqueeze(1)
             
             # Sample t from logit-normal distribution (JiT-style)
             # z ~ N(P_mean, P_std), then t = sigmoid(z)
@@ -220,62 +227,44 @@ def train(args):
             model_output = model(z_t, t, y)
             
             # Loss
-            if args.loss_type == 'epsilon':
+            if args.loss_type == 'epsilon_epsilon_loss':
                 target = noise
                 loss = F.mse_loss(model_output, target)
-            elif args.loss_type == 'x':
-                # JiT-style: Model predicts x, but loss is on velocity
-                # v = (x - z_t) / (1 - t)
-                x_pred = model_output
+            elif args.loss_type == 'v_v_loss':
+                # Direct v-prediction: Model predicts v directly
+                v_pred = model_output
                 
-                # Ground truth velocity
-                v_target = (x - z_t) / (1 - t.view(-1, 1, 1) + 1e-5)
-                
-                # Predicted velocity (derived from predicted x)
-                v_pred = (x_pred - z_t) / (1 - t.view(-1, 1, 1) + 1e-5)
-                
-                # Loss on velocity
-                loss = F.mse_loss(v_pred, v_target)
-            elif args.loss_type == 'v':
-                # Plan: v_target = clean_audio - noise
-                # v_pred = (model_output - z_t) / (1 - t)
-                # Wait, if model_output is predicting x (as implied by "Convert model prediction to velocity"),
-                # then we first predict x, then convert to v?
-                # Or does the model predict v directly?
-                # Plan says: "If predicting x: derive v = ...".
-                # But then "If loss_type='mse_v': ... Convert model prediction to velocity: v_pred = (model_output - z_t) / (1 - t)"
-                # This implies model_output IS x_pred.
-                # So we are training x-prediction model but minimizing v-loss.
-                
-                # Let's assume model outputs x always for this mode, and we compute loss on v.
-                # Or does model output v?
-                # "The paper's final algorithm ... uses x-prediction but optimizes the v-loss".
-                # So Model -> x_pred.
-                # v_pred_from_x = (x_pred - z_t) / (1 - t) ???
-                # Let's check the math.
-                # z_t = t * x + (1-t) * eps
-                # v = dx/dt = x - eps (velocity of the flow)
-                # If we have x_pred, can we get v_pred?
-                # z_t = t * x_pred + (1-t) * eps_pred
-                # This is circular if we don't have eps.
-                
-                # Actually, v = x - eps.
-                # And z_t = t * x + (1-t) * eps
-                # z_t = t * x + (1-t) * (x - v) = x - (1-t)v
-                # => (1-t)v = x - z_t
-                # => v = (x - z_t) / (1-t)
-                # YES.
-                
-                # So:
-                # 1. Model predicts x_pred.
-                # 2. v_pred = (x_pred - z_t) / (1 - t + 1e-5)
-                # 3. v_target = x - noise
-                # 4. Loss = MSE(v_pred, v_target)
-                
-                x_pred = model_output
-                v_pred = (x_pred - z_t) / (1 - t.view(-1, 1, 1) + 1e-5)
+                # Calculate Ground Truth Velocity
+                # v = x - epsilon
                 v_target = x - noise
+                
+                # Compute Loss
                 loss = F.mse_loss(v_pred, v_target)
+            elif args.loss_type == 'x_v_loss':
+                # 1. JI-T Philosophy: The Network predicts X (Clean Audio)
+                x_pred = model_output 
+    
+                # 2. Reshape t for broadcasting
+                t_view = t.view(*([t.shape[0]] + [1] * (x.dim() - 1)))
+                
+                # 3. CRITICAL: The paper clips the denominator to avoid explosion at t=1
+                # See paper: "clip its denominator (by default, 0.05)"
+                denominator = 1 - t_view
+                denominator = torch.clamp(denominator, min=0.05) 
+                
+                # 4. Calculate Velocity Prediction (Formula from Eq. 6)
+                # v_pred = (x_pred - z_t) / (1 - t)
+                v_pred = (x_pred - z_t) / denominator
+                
+                # 5. Calculate Ground Truth Velocity
+                # It is cleaner to use (x - noise) than deriving it from z_t
+                # v = x - epsilon [cite: 120]
+                v_target = x - noise
+                
+                # 6. Compute Loss
+                loss = F.mse_loss(v_pred, v_target)
+            else:
+                raise ValueError(f"Unknown loss type: {args.loss_type}")
             
             optimizer.zero_grad()
             loss.backward()
@@ -298,7 +287,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--experiment_name', type=str, required=True)
     parser.add_argument('--dataset_mode', type=str, default='raw', choices=['raw', 'spectrogram'])
-    parser.add_argument('--loss_type', type=str, default='x', choices=['epsilon', 'x', 'v'])
+    parser.add_argument('--loss_type', type=str, default='x', choices=['epsilon_epsilon_loss', 'v_v_loss', 'x_v_loss'])
     parser.add_argument('--patch_size', type=int, default=512)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=50)
