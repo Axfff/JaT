@@ -26,6 +26,7 @@ run_experiment() {
     python3 src/train.py \
         --experiment_name "$exp_name" \
         --dataset_mode "$dataset_mode" \
+        --patch_size "$patch_size" \
         --loss_type "$pred_mode" \
         --epochs "$EPOCHS" \
         --hidden_size "$HIDDEN_SIZE" \
