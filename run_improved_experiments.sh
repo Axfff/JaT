@@ -79,7 +79,7 @@ run_experiment() {
     run_experiment "improved_raw_x" "raw" "x_v_loss" 64 "cuda:0"
     
     # 6. Extra: Raw + X_v (Large Patch)
-    run_experiment "improved_raw_x_250" "raw" "x_v_loss" 250 "cuda:0"
+    run_experiment "improved_raw_x_256" "raw" "x_v_loss" 256 "cuda:0"
 ) &
 
 # GPU 1 Experiments
@@ -91,7 +91,7 @@ run_experiment() {
     run_experiment "improved_raw_eps" "raw" "v_v_loss" 64 "cuda:1"
     
     # 5. Extra: Raw + Velocity_v (Large Patch)
-    run_experiment "improved_raw_eps_250" "raw" "v_v_loss" 250 "cuda:1"
+    run_experiment "improved_raw_eps_256" "raw" "v_v_loss" 256 "cuda:1"
 ) &
 
 wait

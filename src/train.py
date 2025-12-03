@@ -226,6 +226,15 @@ def train(args):
             # Model prediction (pass raw t in [0, 1], not scaled)
             model_output = model(z_t, t, y)
             
+            # Validate output shape matches input shape
+            if model_output.shape != x.shape:
+                raise RuntimeError(
+                    f"Model output shape {model_output.shape} doesn't match input shape {x.shape}. "
+                    f"This usually indicates a patch size issue. "
+                    f"Patch size {args.patch_size} must divide evenly into input size "
+                    f"({'16384 for raw audio' if args.dataset_mode == 'raw' else '64 for spectrogram'})."
+                )
+            
             # Loss
             if args.loss_type == 'epsilon_epsilon_loss':
                 target = noise

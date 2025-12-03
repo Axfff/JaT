@@ -67,18 +67,20 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
                 # Use a larger epsilon for stability or conditional check
                 # At t=0, v is undefined if we just divide. 
                 # But we can assume v is large or just clamp t.
-                v = (z - eps) / torch.maximum(t_batch.view(-1, 1, 1), torch.tensor(1e-3, device=device))
-                
-                v = (z - eps) / torch.maximum(t_batch.view(-1, 1, 1), torch.tensor(1e-3, device=device))
+                # Create proper view shape for broadcasting: [B] -> [B, 1, ...] matching z's dimensions
+                view_shape = [t_batch.shape[0]] + [1] * (z.dim() - 1)
+                t_view = t_batch.view(*view_shape)
+                v = (z - eps) / torch.maximum(t_view, torch.tensor(1e-3, device=device))
                 
             elif pred_mode == 'x' or pred_mode == 'x_v_loss':
                 x = model_out
                 # v = (x - z_t) / (1 - t)
                 # Note: t is in [0, 1].
                 # At t=1, 1-t=0. We need to clip.
-                v = (x - z) / torch.maximum(1 - t_batch.view(-1, 1, 1), torch.tensor(1e-5, device=device))
-                
-                v = (x - z) / torch.maximum(1 - t_batch.view(-1, 1, 1), torch.tensor(1e-5, device=device))
+                # Create proper view shape for broadcasting: [B] -> [B, 1, ...] matching z's dimensions
+                view_shape = [t_batch.shape[0]] + [1] * (z.dim() - 1)
+                t_view = t_batch.view(*view_shape)
+                v = (x - z) / torch.maximum(1 - t_view, torch.tensor(1e-5, device=device))
                 
             elif pred_mode == 'v' or pred_mode == 'v_v_loss':
                 # WARNING: This assumes model outputs v directly.

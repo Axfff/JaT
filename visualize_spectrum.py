@@ -268,6 +268,13 @@ def compute_metrics(predictions, groundtruth, pred_is_waveform=True, gt_is_wavef
         pred_specs.append(pred_spec)
         gt_specs.append(gt_spec)
     
+    # Check if we have any samples to compare
+    if len(pred_specs) == 0 or len(gt_specs) == 0:
+        print("ERROR: No samples to compare. Predictions or groundtruth list is empty.")
+        print(f"  - Predictions: {len(predictions)} samples")
+        print(f"  - Groundtruth: {len(groundtruth)} samples")
+        return {}
+    
     # Stack into tensors
     pred_specs = torch.stack(pred_specs)  # (N, 64, 64)
     gt_specs = torch.stack(gt_specs)      # (N, 64, 64)
@@ -384,6 +391,11 @@ def main():
     # Compute metrics
     print("\nComputing metrics...")
     metrics = compute_metrics(predictions, groundtruth, pred_is_waveform, gt_is_waveform)
+    
+    if not metrics:
+        print("\nERROR: Could not compute metrics (likely due to empty predictions).")
+        print("Exiting without creating visualization.")
+        return
     
     print("\n" + "="*50)
     print("METRICS:")
