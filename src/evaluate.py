@@ -39,7 +39,11 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
             # z_t = t * x + (1-t) * eps
             # v = x - eps
             
-            if pred_mode == 'epsilon':
+            # Calculate v
+            # z_t = t * x + (1-t) * eps
+            # v = x - eps
+            
+            if pred_mode == 'epsilon' or pred_mode == 'epsilon_epsilon_loss':
                 eps = model_out
                 # x = (z - (1-t)*eps) / t
                 # This is unstable at t=0.
@@ -65,14 +69,18 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
                 # But we can assume v is large or just clamp t.
                 v = (z - eps) / torch.maximum(t_batch.view(-1, 1, 1), torch.tensor(1e-3, device=device))
                 
-            elif pred_mode == 'x':
+                v = (z - eps) / torch.maximum(t_batch.view(-1, 1, 1), torch.tensor(1e-3, device=device))
+                
+            elif pred_mode == 'x' or pred_mode == 'x_v_loss':
                 x = model_out
                 # v = (x - z_t) / (1 - t)
                 # Note: t is in [0, 1].
                 # At t=1, 1-t=0. We need to clip.
                 v = (x - z) / torch.maximum(1 - t_batch.view(-1, 1, 1), torch.tensor(1e-5, device=device))
                 
-            elif pred_mode == 'v':
+                v = (x - z) / torch.maximum(1 - t_batch.view(-1, 1, 1), torch.tensor(1e-5, device=device))
+                
+            elif pred_mode == 'v' or pred_mode == 'v_v_loss':
                 # WARNING: This assumes model outputs v directly.
                 # If trained with loss_type='v' in train.py, the model actually predicts x!
                 # Use pred_mode='x' for models trained with loss_type='v'.
@@ -101,7 +109,7 @@ def save_audio(batch, dataset_mode, output_dir, sample_rate=16000):
             # Let's try to invert for FAD.
             
             inv_mel = torchaudio.transforms.InverseMelScale(n_stft=1024 // 2 + 1, n_mels=64, sample_rate=sample_rate)
-            griffin_lim = torchaudio.transforms.GriffinLim(n_fft=1024, hop_length=256)
+            griffin_lim = torchaudio.transforms.GriffinLim(n_fft=1024, hop_length=256, n_iter=64, momentum=0.99)
             
             # spec is log(mel + 1e-9). Inverse log.
             spec = torch.exp(spec) - 1e-9
@@ -132,7 +140,7 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, default='results')
     parser.add_argument('--num_samples', type=int, default=16)
     parser.add_argument('--dataset_mode', type=str, default='raw')
-    parser.add_argument('--pred_mode', type=str, default='x', choices=['epsilon', 'x', 'v'])
+    parser.add_argument('--pred_mode', type=str, default='x', choices=['epsilon', 'x', 'v', 'epsilon_epsilon_loss', 'v_v_loss', 'x_v_loss'])
     parser.add_argument('--patch_size', type=int, default=512)
     parser.add_argument('--noise_scale', type=float, default=1.0, help='Noise scale factor')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
