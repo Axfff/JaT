@@ -4,11 +4,53 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 
+
 # Set backend to soundfile to avoid torchcodec issues
 try:
     torchaudio.set_audio_backend("soundfile")
 except:
     pass
+
+# Normalization Constants (Fixed Global Statistics)
+# Log-Mel Spectrogram values typically range from -11.0 to 0.0 (after log(spec + 1e-9))
+# We center around -5.0 and scale by 3.0 to get approx [-2, 2] range, then clip and scale to [-1, 1]
+NORM_MEAN = -5.0
+NORM_STD = 3.0
+
+def normalize_spectrogram(spec):
+    """
+    Normalize spectrogram using fixed global statistics.
+    Args:
+        spec: (..., F, T) Mel spectrogram (log-scaled)
+    Returns:
+        norm_spec: Normalized spectrogram in range approx [-1, 1]
+    """
+    # Standardize
+    norm_spec = (spec - NORM_MEAN) / NORM_STD
+    
+    # Clip to [-3, 3] (approx 99.7% of data if Gaussian, but here just safety)
+    norm_spec = torch.clamp(norm_spec, min=-3.0, max=3.0)
+    
+    # Scale to [-1, 1]
+    norm_spec = norm_spec / 3.0
+    
+    return norm_spec
+
+def denormalize_spectrogram(norm_spec):
+    """
+    Denormalize spectrogram to original log-scale range.
+    Args:
+        norm_spec: (..., F, T) Normalized spectrogram in range [-1, 1]
+    Returns:
+        spec: Log-scaled Mel spectrogram
+    """
+    # Rescale from [-1, 1] to [-3, 3]
+    spec = norm_spec * 3.0
+    
+    # Destandardize
+    spec = spec * NORM_STD + NORM_MEAN
+    
+    return spec
 
 class SpeechCommandsDataset(Dataset):
     def __init__(self, root, mode='raw', subset='training', download=True, mock=False):
@@ -193,11 +235,8 @@ class SpeechCommandsDataset(Dataset):
             # Log scaling usually helps
             spec = torch.log(spec + 1e-9)
             
-            # Normalize to zero mean and unit variance (approximate based on batch statistics or fixed)
-            # For simplicity and stability, let's just normalize per sample for now, 
-            # or use a fixed global mean/std if known. 
-            # Let's use per-sample standardization.
-            spec = (spec - spec.mean()) / (spec.std() + 1e-5)
+            # Normalize using fixed global statistics
+            spec = normalize_spectrogram(spec)
             
             return spec, self.label_to_idx.get(label, 0)
             

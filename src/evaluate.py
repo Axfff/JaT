@@ -1,14 +1,14 @@
 import os
 import argparse
 import torch
+from torch.cuda.amp import autocast
 import torchaudio
 import numpy as np
 from tqdm import tqdm
 from frechet_audio_distance import FrechetAudioDistance
 from frechet_audio_distance import FrechetAudioDistance
 from model import JiT
-from dataset import get_dataloader
-from dataset import get_dataloader
+from dataset import get_dataloader, denormalize_spectrogram
 import soundfile as sf
 
 
@@ -33,7 +33,8 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
             t_batch = torch.ones(num_samples, device=device) * t
             
             # Model input t in [0, 1] (raw, not scaled)
-            model_out = model(z, t_batch, y)
+            with autocast(enabled=(device!='cpu')):
+                model_out = model(z, t_batch, y)
             
             # Calculate v
             # z_t = t * x + (1-t) * eps
@@ -114,6 +115,9 @@ def save_audio(batch, dataset_mode, output_dir, sample_rate=16000):
             griffin_lim = torchaudio.transforms.GriffinLim(n_fft=1024, hop_length=256, n_iter=64, momentum=0.99)
             
             # spec is log(mel + 1e-9). Inverse log.
+            # But first, denormalize!
+            spec = denormalize_spectrogram(spec)
+            
             spec = torch.exp(spec) - 1e-9
             spec = spec.cpu()
             

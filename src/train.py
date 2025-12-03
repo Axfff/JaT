@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import numpy as np
 
@@ -161,6 +162,9 @@ def train(args):
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     
+    # FP16 Scaler
+    scaler = GradScaler(enabled=args.fp16)
+    
     # Scheduler / Flow
     # Plan: z_t = t * x_0 + (1-t) * epsilon
     # This implies t goes from 0 (noise) to 1 (data)?
@@ -224,7 +228,8 @@ def train(args):
             z_t, _ = flow.q_sample(x, t, noise)
             
             # Model prediction (pass raw t in [0, 1], not scaled)
-            model_output = model(z_t, t, y)
+            with autocast(enabled=args.fp16):
+                model_output = model(z_t, t, y)
             
             # Validate output shape matches input shape
             if model_output.shape != x.shape:
@@ -275,9 +280,15 @@ def train(args):
             else:
                 raise ValueError(f"Unknown loss type: {args.loss_type}")
             
+            # FP16 Backward Pass
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            
+            # Scale loss and backward
+            scaler.scale(loss).backward()
+            
+            # Unscale and step
+            scaler.step(optimizer)
+            scaler.update()
             
             pbar.set_postfix({'loss': loss.item()})
             epoch_loss += loss.item()
@@ -315,6 +326,7 @@ if __name__ == "__main__":
     parser.add_argument('--P_std', type=float, default=0.8, help='Logit-normal std for time sampling')
     parser.add_argument('--noise_scale', type=float, default=1.0, help='Noise scale factor')
     parser.add_argument('--t_eps', type=float, default=5e-2, help='Minimum t value to avoid division by zero')
+    parser.add_argument('--fp16', action='store_true', default=True, help='Enable mixed precision training')
     
     args = parser.parse_args()
     train(args)

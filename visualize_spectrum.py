@@ -11,7 +11,8 @@ from tqdm import tqdm
 import sys
 sys.path.append('src')
 from src.model import JiT
-from src.dataset import get_dataloader, SpeechCommandsDataset
+from src.model import JiT
+from src.dataset import get_dataloader, SpeechCommandsDataset, normalize_spectrogram
 
 
 def waveform_to_spectrogram(waveform, sample_rate=16000):
@@ -47,10 +48,13 @@ def waveform_to_spectrogram(waveform, sample_rate=16000):
     # Log scaling
     spec = torch.log(spec + 1e-9)
     
+    # Normalize using shared function
+    spec = normalize_spectrogram(spec)
+    
     return spec.squeeze(0)  # (64, 64)
 
 
-def load_model_predictions(checkpoint_path, dataset_mode, pred_mode, num_samples, device='cuda'):
+def load_model_predictions(checkpoint_path, dataset_mode, pred_mode, num_samples, patch_size=512, device='cuda'):
     """
     Load model and generate predictions.
     
@@ -77,7 +81,7 @@ def load_model_predictions(checkpoint_path, dataset_mode, pred_mode, num_samples
         
     model = JiT(
         input_size=input_size,
-        patch_size=512,
+        patch_size=patch_size,
         in_channels=in_channels,
         hidden_size=512,
         depth=12,
@@ -330,6 +334,8 @@ def main():
                         help='Device to run on')
     parser.add_argument('--use_predictions', type=str, default=None,
                         help='Optional: path to pre-generated predictions directory (skip model inference)')
+    parser.add_argument('--patch_size', type=int, default=512,
+                        help='Patch size for the model (default: 512)')
     
     args = parser.parse_args()
     
@@ -363,6 +369,7 @@ def main():
             args.dataset_mode,
             args.pred_mode,
             args.num_samples,
+            args.patch_size,
             args.device
         )
         predictions = [predictions[i] for i in range(len(predictions))]
