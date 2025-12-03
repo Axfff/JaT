@@ -7,3 +7,5 @@ plan.md
 results*
 spectrum_comparisons
 .DS_Store
+*.pyc
+__pycache__/
