@@ -136,7 +136,13 @@ class VisionRotaryEmbeddingFast(nn.Module):
             self.register_buffer("freqs_cos", freqs.cos().view(-1, freqs.shape[-1]))
             self.register_buffer("freqs_sin", freqs.sin().view(-1, freqs.shape[-1]))
 
-    def forward(self, t): return  t * self.freqs_cos + rotate_half(t) * self.freqs_sin
+    def forward(self, t):
+        dtype = t.dtype
+        t = t.float()
+        freqs_cos = self.freqs_cos.float()
+        freqs_sin = self.freqs_sin.float()
+        out = t * freqs_cos + rotate_half(t) * freqs_sin
+        return out.to(dtype)
 
 
 class RMSNorm(nn.Module):

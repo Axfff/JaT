@@ -231,54 +231,54 @@ def train(args):
             with autocast(enabled=args.fp16):
                 model_output = model(z_t, t, y)
             
-            # Validate output shape matches input shape
-            if model_output.shape != x.shape:
-                raise RuntimeError(
-                    f"Model output shape {model_output.shape} doesn't match input shape {x.shape}. "
-                    f"This usually indicates a patch size issue. "
-                    f"Patch size {args.patch_size} must divide evenly into input size "
-                    f"({'16384 for raw audio' if args.dataset_mode == 'raw' else '64 for spectrogram'})."
-                )
-            
-            # Loss
-            if args.loss_type == 'epsilon_epsilon_loss':
-                target = noise
-                loss = F.mse_loss(model_output, target)
-            elif args.loss_type == 'v_v_loss':
-                # Direct v-prediction: Model predicts v directly
-                v_pred = model_output
+                # Validate output shape matches input shape
+                if model_output.shape != x.shape:
+                    raise RuntimeError(
+                        f"Model output shape {model_output.shape} doesn't match input shape {x.shape}. "
+                        f"This usually indicates a patch size issue. "
+                        f"Patch size {args.patch_size} must divide evenly into input size "
+                        f"({'16384 for raw audio' if args.dataset_mode == 'raw' else '64 for spectrogram'})."
+                    )
                 
-                # Calculate Ground Truth Velocity
-                # v = x - epsilon
-                v_target = x - noise
-                
-                # Compute Loss
-                loss = F.mse_loss(v_pred, v_target)
-            elif args.loss_type == 'x_v_loss':
-                # 1. JI-T Philosophy: The Network predicts X (Clean Audio)
-                x_pred = model_output 
-    
-                # 2. Reshape t for broadcasting
-                t_view = t.view(*([t.shape[0]] + [1] * (x.dim() - 1)))
-                
-                # 3. CRITICAL: The paper clips the denominator to avoid explosion at t=1
-                # See paper: "clip its denominator (by default, 0.05)"
-                denominator = 1 - t_view
-                denominator = torch.clamp(denominator, min=0.05) 
-                
-                # 4. Calculate Velocity Prediction (Formula from Eq. 6)
-                # v_pred = (x_pred - z_t) / (1 - t)
-                v_pred = (x_pred - z_t) / denominator
-                
-                # 5. Calculate Ground Truth Velocity
-                # It is cleaner to use (x - noise) than deriving it from z_t
-                # v = x - epsilon [cite: 120]
-                v_target = x - noise
-                
-                # 6. Compute Loss
-                loss = F.mse_loss(v_pred, v_target)
-            else:
-                raise ValueError(f"Unknown loss type: {args.loss_type}")
+                # Loss
+                if args.loss_type == 'epsilon_epsilon_loss':
+                    target = noise
+                    loss = F.mse_loss(model_output, target)
+                elif args.loss_type == 'v_v_loss':
+                    # Direct v-prediction: Model predicts v directly
+                    v_pred = model_output
+                    
+                    # Calculate Ground Truth Velocity
+                    # v = x - epsilon
+                    v_target = x - noise
+                    
+                    # Compute Loss
+                    loss = F.mse_loss(v_pred, v_target)
+                elif args.loss_type == 'x_v_loss':
+                    # 1. JI-T Philosophy: The Network predicts X (Clean Audio)
+                    x_pred = model_output 
+        
+                    # 2. Reshape t for broadcasting
+                    t_view = t.view(*([t.shape[0]] + [1] * (x.dim() - 1)))
+                    
+                    # 3. CRITICAL: The paper clips the denominator to avoid explosion at t=1
+                    # See paper: "clip its denominator (by default, 0.05)"
+                    denominator = 1 - t_view
+                    denominator = torch.clamp(denominator, min=0.05) 
+                    
+                    # 4. Calculate Velocity Prediction (Formula from Eq. 6)
+                    # v_pred = (x_pred - z_t) / (1 - t)
+                    v_pred = (x_pred - z_t) / denominator
+                    
+                    # 5. Calculate Ground Truth Velocity
+                    # It is cleaner to use (x - noise) than deriving it from z_t
+                    # v = x - epsilon [cite: 120]
+                    v_target = x - noise
+                    
+                    # 6. Compute Loss
+                    loss = F.mse_loss(v_pred, v_target)
+                else:
+                    raise ValueError(f"Unknown loss type: {args.loss_type}")
             
             # FP16 Backward Pass
             optimizer.zero_grad()
