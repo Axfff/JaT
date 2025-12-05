@@ -9,3 +9,5 @@ spectrum_comparisons
 .DS_Store
 *.pyc
 __pycache__/
+test_*
+tmp_*

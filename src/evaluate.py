@@ -10,6 +10,31 @@ from frechet_audio_distance import FrechetAudioDistance
 from model import JiT
 from dataset import get_dataloader, denormalize_spectrogram
 import soundfile as sf
+import torchaudio
+
+# Monkeypatch torchaudio for speechbrain compatibility
+if not hasattr(torchaudio, 'list_audio_backends'):
+    torchaudio.list_audio_backends = lambda: ['soundfile']
+
+from speechbrain.inference.vocoders import HIFIGAN
+
+# Global vocoder instance
+VOCODER = None
+
+def load_vocoder(device='cuda'):
+    global VOCODER
+    if VOCODER is None:
+        print("Loading HiFi-GAN vocoder...")
+        try:
+            # Use a local directory for the model to avoid re-downloading
+            savedir = os.path.join(os.path.expanduser("~"), ".gemini", "speechbrain_hifigan")
+            os.makedirs(savedir, exist_ok=True)
+            VOCODER = HIFIGAN.from_hparams(source="speechbrain/tts-hifigan-libritts-16kHz", savedir=savedir, run_opts={"device": device})
+            print("HiFi-GAN loaded.")
+        except Exception as e:
+            print(f"Failed to load HiFi-GAN: {e}")
+            VOCODER = None
+    return VOCODER
 
 
 
@@ -93,50 +118,76 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
             
     return z
 
-def save_audio(batch, dataset_mode, output_dir, sample_rate=16000):
+def save_audio(batch, dataset_mode, output_dir, sample_rate=16000, device='cuda'):
     os.makedirs(output_dir, exist_ok=True)
+    
+    vocoder = None
+    if dataset_mode == 'spectrogram':
+        vocoder = load_vocoder(device=device)
+
     for i, item in enumerate(batch):
         if dataset_mode == 'spectrogram':
-            # item: [1, 4096] -> [1, 64, 64]
-            spec = item.view(1, 64, 64)
-            # Inverse Mel? Griffin-Lim.
-            # We need to match the MelSpectrogram params from dataset.py
-            # n_fft=1024, hop_length=256, n_mels=64
-            # But we don't have the phase.
-            # Griffin-Lim requires linear spectrogram, not Mel.
-            # So we need InverseMelScale first.
+            # item: [1, 64, 64] (or similar)
+            # We need to ensure it's on the correct device for the vocoder
+            spec = item.to(device)
             
-            # This is complicated. 
-            # For "Control", maybe we just visualize the spectrogram?
-            # Or we try to invert.
-            # Let's try to invert for FAD.
-            
-            inv_mel = torchaudio.transforms.InverseMelScale(n_stft=1024 // 2 + 1, n_mels=64, sample_rate=sample_rate)
-            griffin_lim = torchaudio.transforms.GriffinLim(n_fft=1024, hop_length=256, n_iter=64, momentum=0.99)
-            
-            # spec is log(mel + 1e-9). Inverse log.
-            # But first, denormalize!
+            if spec.dim() == 2:
+                spec = spec.unsqueeze(0) # [1, 64, 64]
+                
+            # Denormalize
             spec = denormalize_spectrogram(spec)
             
-            spec = torch.exp(spec) - 1e-9
-            spec = spec.cpu()
+            # Log-Mel to Linear Mel (HiFi-GAN expects log-mel, but let's check range)
+            # SpeechBrain HiFi-GAN expects log-mel spectrograms.
+            # Our denormalize returns log-mel.
             
-            try:
-                linear_spec = inv_mel(spec)
-                waveform = griffin_lim(linear_spec)
-            except Exception as e:
-                print(f"Griffin-Lim failed: {e}")
-                waveform = torch.zeros(1, 16000)
+            # Resize from 64 mels to 80 mels
+            # Input: [1, 64, T]
+            # We treat it as an image [1, 1, 64, T] for interpolation
+            spec_img = spec.unsqueeze(1) 
+            
+            # Interpolate
+            # Note: We want to preserve the time dimension T, and change 64 -> 80
+            # Target size: (80, T)
+            T = spec.shape[-1]
+            spec_80_img = torch.nn.functional.interpolate(spec_img, size=(80, T), mode='bilinear', align_corners=False)
+            spec_80 = spec_80_img.squeeze(1) # [1, 80, T]
+            
+            # HiFi-GAN expects [B, T, Mel] or [B, Mel, T]?
+            # In our test, [B, Mel, T] worked and produced [B, 1, T_out]
+            
+            waveform = None
+            if vocoder is not None:
+                try:
+                    # decode_batch expects [B, Mel, T]
+                    wav = vocoder.decode_batch(spec_80)
+                    waveform = wav.squeeze(1) # [1, T_out]
+                except Exception as e:
+                    print(f"HiFi-GAN inference failed: {e}")
+            
+            if waveform is None:
+                # Fallback to Griffin-Lim (Legacy)
+                print("Falling back to Griffin-Lim...")
+                inv_mel = torchaudio.transforms.InverseMelScale(n_stft=1024 // 2 + 1, n_mels=64, sample_rate=sample_rate).to(device)
+                griffin_lim = torchaudio.transforms.GriffinLim(n_fft=1024, hop_length=256, n_iter=64, momentum=0.99).to(device)
                 
+                # Inverse log
+                spec_linear = torch.exp(spec) - 1e-9
+                try:
+                    linear_spec = inv_mel(spec_linear)
+                    waveform = griffin_lim(linear_spec)
+                except Exception as e:
+                    print(f"Griffin-Lim failed: {e}")
+                    waveform = torch.zeros(1, 16000, device=device)
+
         else:
-            waveform = item.cpu()
+            waveform = item.to(device)
             
-        # Normalize
+        # Normalize audio volume
+        waveform = waveform.cpu()
         waveform = waveform / torch.max(torch.abs(waveform) + 1e-9)
         
-        # torchaudio.save(os.path.join(output_dir, f"sample_{i}.wav"), waveform, sample_rate, backend="soundfile")
-        # Use soundfile directly
-        # waveform is [1, T] or [T]
+        # Save
         wav_np = waveform.squeeze().numpy()
         sf.write(os.path.join(output_dir, f"sample_{i}.wav"), wav_np, sample_rate)
 
@@ -187,5 +238,5 @@ if __name__ == "__main__":
     samples = sample(model, args.num_samples, dataset_mode=args.dataset_mode, 
                     pred_mode=args.pred_mode, noise_scale=args.noise_scale, device=args.device)
     
-    save_audio(samples, args.dataset_mode, args.output_dir)
+    save_audio(samples, args.dataset_mode, args.output_dir, device=args.device)
     print(f"Saved to {args.output_dir}")
