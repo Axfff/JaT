@@ -239,6 +239,52 @@ class SwiGLUFFN(nn.Module):
         return self.w3(self.ffn_dropout(hidden))
 
 
+class Snake(nn.Module):
+    """
+    Snake activation function: f(x) = x + sin²(x)
+    
+    Provides inductive bias for periodicity, helping networks generate 
+    sharp harmonics instead of muffled noise. Particularly useful for 
+    audio waveform generation.
+    
+    Reference: Neural Networks Fail to Learn Periodic Functions (Ziyin et al.)
+    """
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        # alpha controls the frequency of the periodic component
+        self.alpha = nn.Parameter(torch.tensor(alpha))
+        
+    def forward(self, x):
+        return x + torch.sin(self.alpha * x) ** 2
+
+
+class SnakeGLUFFN(nn.Module):
+    """
+    GLU-style FFN with Snake activation instead of SiLU.
+    Better suited for audio waveform generation due to periodicity bias.
+    """
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        drop=0.0,
+        bias=True
+    ) -> None:
+        super().__init__()
+        hidden_dim = int(hidden_dim * 2 / 3)
+        self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
+        self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
+        self.ffn_dropout = nn.Dropout(drop)
+        self.snake = Snake(alpha=1.0)
+
+    def forward(self, x):
+        x12 = self.w12(x)
+        x1, x2 = x12.chunk(2, dim=-1)
+        # Use Snake activation instead of SiLU for periodicity bias
+        hidden = self.snake(x1) * x2
+        return self.w3(self.ffn_dropout(hidden))
+
+
 class FinalLayer(nn.Module):
     """
     The final layer of JiT.
@@ -289,14 +335,20 @@ class SpectrumFinalLayer(nn.Module):
 
 
 class JiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0, use_snake=False):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
                               attn_drop=attn_drop, proj_drop=proj_drop)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
+        
+        # Use Snake activation for audio waveform generation
+        if use_snake:
+            self.mlp = SnakeGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
+        else:
+            self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
+            
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -318,6 +370,9 @@ class JiT(nn.Module):
     - is_1d=False, is_spectrum=False: Standard 2D image patchification (default)  
     - is_1d=True: 1D signal patchification (for raw audio)
     - is_spectrum=True: Spectrum patchification (patches along time axis only, preserves full frequency)
+    
+    Args:
+        use_snake: If True, use Snake activation in FFN blocks for better audio periodicity
     """
     def __init__(
         self,
@@ -337,7 +392,8 @@ class JiT(nn.Module):
         is_1d=False,
         is_spectrum=False,
         freq_bins=64,  # For spectrum mode: number of frequency bins
-        time_frames=64  # For spectrum mode: number of time frames
+        time_frames=64,  # For spectrum mode: number of time frames
+        use_snake=False  # Use Snake activation for audio waveform generation
     ):
         super().__init__()
         self.is_1d = is_1d
@@ -353,6 +409,7 @@ class JiT(nn.Module):
         self.in_context_len = in_context_len
         self.in_context_start = in_context_start
         self.num_classes = num_classes
+        self.use_snake = use_snake
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -405,11 +462,12 @@ class JiT(nn.Module):
             is_1d=rope_is_1d
         )
 
-        # transformer
+        # transformer blocks with optional Snake activation
         self.blocks = nn.ModuleList([
             JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                      attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
-                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0)
+                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
+                     use_snake=use_snake)
             for i in range(depth)
         ])
 

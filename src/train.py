@@ -12,6 +12,71 @@ import numpy as np
 from dataset import get_dataloader
 from model import JiT, JiT_models
 
+
+# --- Multi-Scale Spectral Loss for Audio ---
+class MultiScaleSpectralLoss(nn.Module):
+    """
+    Multi-scale spectral loss to improve audio fidelity.
+    
+    Computes L1 loss between STFT magnitudes at multiple window sizes.
+    This guides the model to preserve high-frequency content that MSE 
+    on waveforms tends to blur out.
+    
+    Args:
+        fft_sizes: List of FFT window sizes to use (default: [512, 1024, 2048])
+        hop_ratio: Hop length as ratio of FFT size (default: 0.25)
+        weight: Weight for the spectral loss term (default: 0.1)
+    """
+    def __init__(self, fft_sizes=[512, 1024, 2048], hop_ratio=0.25, weight=0.1):
+        super().__init__()
+        self.fft_sizes = fft_sizes
+        self.hop_ratio = hop_ratio
+        self.weight = weight
+        
+    def forward(self, pred_wave, target_wave):
+        """
+        Compute multi-scale spectral loss.
+        
+        Args:
+            pred_wave: Predicted waveform [B, C, L] or [B, L]
+            target_wave: Target waveform [B, C, L] or [B, L]
+            
+        Returns:
+            Spectral loss value (already weighted)
+        """
+        # Flatten to [B, L] if needed
+        if pred_wave.dim() == 3:
+            pred_wave = pred_wave.squeeze(1)
+            target_wave = target_wave.squeeze(1)
+        
+        loss = 0.0
+        for fft_size in self.fft_sizes:
+            hop_length = int(fft_size * self.hop_ratio)
+            
+            # Compute STFT magnitude
+            pred_spec = torch.stft(
+                pred_wave, 
+                n_fft=fft_size, 
+                hop_length=hop_length,
+                window=torch.hann_window(fft_size, device=pred_wave.device),
+                return_complex=True
+            ).abs()
+            
+            target_spec = torch.stft(
+                target_wave, 
+                n_fft=fft_size, 
+                hop_length=hop_length,
+                window=torch.hann_window(fft_size, device=target_wave.device),
+                return_complex=True
+            ).abs()
+            
+            # L1 loss on magnitude (ignores phase misalignment)
+            loss += F.l1_loss(pred_spec, target_spec)
+        
+        # Average over number of scales and apply weight
+        return self.weight * (loss / len(self.fft_sizes))
+
+
 # --- Noise Scheduler ---
 def get_beta_schedule(num_timesteps, beta_start=0.0001, beta_end=0.02):
     return torch.linspace(beta_start, beta_end, num_timesteps)
@@ -181,7 +246,8 @@ def train(args):
         is_1d=is_1d,
         is_spectrum=is_spectrum,
         freq_bins=freq_bins if freq_bins else 64,
-        time_frames=time_frames if time_frames else 64
+        time_frames=time_frames if time_frames else 64,
+        use_snake=args.use_snake  # Snake activation for audio periodicity
     ).to(device)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
@@ -198,6 +264,15 @@ def train(args):
     # Yes.
     
     flow = FlowMatching(device)
+    
+    # Multi-Scale Spectral Loss for raw audio waveforms
+    spectral_loss_fn = None
+    if args.use_spectral_loss and args.dataset_mode == 'raw':
+        spectral_loss_fn = MultiScaleSpectralLoss(
+            fft_sizes=[512, 1024, 2048],
+            weight=args.spectral_loss_weight
+        )
+        print(f"Using Multi-Scale Spectral Loss with weight={args.spectral_loss_weight}")
     
     model.train()
     
@@ -296,7 +371,16 @@ def train(args):
                     v_target = x - noise
                     
                     # 6. Compute Loss (in float32 for numerical stability)
-                    loss = F.mse_loss(v_pred.float(), v_target.float())
+                    loss_time = F.mse_loss(v_pred.float(), v_target.float())
+                    
+                    # 7. Add Multi-Scale Spectral Loss for raw audio (if enabled)
+                    # This guides the model to preserve high-frequency content
+                    if spectral_loss_fn is not None:
+                        # Spectral loss on predicted clean audio vs target clean audio
+                        loss_freq = spectral_loss_fn(x_pred.float(), x.float())
+                        loss = loss_time + loss_freq
+                    else:
+                        loss = loss_time
                 else:
                     raise ValueError(f"Unknown loss type: {args.loss_type}")
             
@@ -359,6 +443,14 @@ if __name__ == "__main__":
     parser.add_argument('--noise_scale', type=float, default=1.0, help='Noise scale factor')
     parser.add_argument('--t_eps', type=float, default=5e-2, help='Minimum t value to avoid division by zero')
     parser.add_argument('--fp16', action='store_true', default=True, help='Enable mixed precision training')
+    
+    # Audio-specific improvements
+    parser.add_argument('--use_snake', action='store_true', default=False, 
+                        help='Use Snake activation for better audio periodicity (recommended for raw audio)')
+    parser.add_argument('--use_spectral_loss', action='store_true', default=False,
+                        help='Add multi-scale spectral loss for raw audio (guides high-frequency preservation)')
+    parser.add_argument('--spectral_loss_weight', type=float, default=0.1,
+                        help='Weight for spectral loss term (default: 0.1)')
     
     args = parser.parse_args()
     train(args)
