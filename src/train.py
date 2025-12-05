@@ -129,19 +129,40 @@ def train(args):
     )
     
     # Model
-    print(f"Creating model: Patch={args.patch_size}, Loss={args.loss_type}")
+    print(f"Creating model: Patch={args.patch_size}, Loss={args.loss_type}, Mode={args.dataset_mode}")
     # Determine input channels and size based on mode
     if args.dataset_mode == 'raw':
         # Raw audio input size is 16384 (1 second at 16kHz usually, or defined by dataset)
         input_size = 16384 
         in_channels = 1
         patch_size = args.patch_size
-    else: # spectrogram
+        is_1d = True
+        is_spectrum = False
+        freq_bins = None
+        time_frames = None
+    elif args.dataset_mode == 'spectrogram':
+        # Standard 2D spectrogram patchification (like image patches)
         # JiT expects square image input.
         # Our spectrogram is 64x64.
         input_size = 64
         in_channels = 1
-        patch_size = args.patch_size # e.g. 16 or 8
+        patch_size = args.patch_size  # e.g. 16 or 8
+        is_1d = False
+        is_spectrum = False
+        freq_bins = None
+        time_frames = None
+    elif args.dataset_mode == 'spectrum_1d':
+        # New mode: Patch only along time axis, preserve full frequency resolution
+        # Each patch covers [freq_bins, patch_size] -> better for audio
+        input_size = 64  # Not used for spectrum mode, but kept for compatibility
+        in_channels = 1
+        patch_size = args.patch_size
+        is_1d = False
+        is_spectrum = True
+        freq_bins = 64  # Number of mel bins
+        time_frames = 64  # Number of time frames
+    else:
+        raise ValueError(f"Unknown dataset_mode: {args.dataset_mode}")
 
     # Instantiate JiT
     # We can use the helper functions if args match, or direct instantiation
@@ -152,12 +173,15 @@ def train(args):
         in_channels=in_channels,
         hidden_size=args.hidden_size,
         depth=args.depth,
-        num_heads=8, # Fixed or arg?
+        num_heads=8,  # Fixed or arg?
         num_classes=35,
         mlp_ratio=4.0,
-        bottleneck_dim=args.hidden_size, # Default
-        in_context_len=0, # Disable in-context for now unless specified
-        is_1d=(args.dataset_mode == 'raw')
+        bottleneck_dim=args.hidden_size,  # Default
+        in_context_len=0,  # Disable in-context for now unless specified
+        is_1d=is_1d,
+        is_spectrum=is_spectrum,
+        freq_bins=freq_bins if freq_bins else 64,
+        time_frames=time_frames if time_frames else 64
     ).to(device)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
@@ -204,17 +228,9 @@ def train(args):
             x = x.to(device)
             y = y.to(device)
             
-            # If spectrogram, flatten
-            # If spectrogram, ensure [B, 1, 64, 64]
-            if args.dataset_mode == 'spectrogram':
-                if x.dim() == 3: # [B, 64, 64] -> [B, 1, 64, 64]
-                    x = x.unsqueeze(1)
-                # If flattened, reshape? Dataset returns [64, 64] usually (after squeeze)
-                # Dataset code: returns spec [64, 64] (if squeezed) or [1, 64, 64]
-                # Let's check dataset.py again. It returns `spec` which is [64, 64] after squeeze.
-                # So x is [B, 64, 64].
-                # We need [B, 1, 64, 64].
-                if x.dim() == 3:
+            # If spectrogram or spectrum_1d, ensure [B, 1, 64, 64]
+            if args.dataset_mode in ['spectrogram', 'spectrum_1d']:
+                if x.dim() == 3:  # [B, 64, 64] -> [B, 1, 64, 64]
                     x = x.unsqueeze(1)
             
             # Sample t from logit-normal distribution (JiT-style)
@@ -322,7 +338,7 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--experiment_name', type=str, required=True)
-    parser.add_argument('--dataset_mode', type=str, default='raw', choices=['raw', 'spectrogram'])
+    parser.add_argument('--dataset_mode', type=str, default='raw', choices=['raw', 'spectrogram', 'spectrum_1d'])
     parser.add_argument('--loss_type', type=str, default='x', choices=['epsilon_epsilon_loss', 'v_v_loss', 'x_v_loss'])
     parser.add_argument('--patch_size', type=int, default=512)
     parser.add_argument('--batch_size', type=int, default=32)

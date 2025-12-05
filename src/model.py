@@ -51,6 +51,57 @@ class BottleneckPatchEmbed(nn.Module):
         return x
 
 
+class SpectrumPatchEmbed(nn.Module):
+    """
+    Spectrogram to Patch Embedding - patches ONLY along time axis.
+    
+    For a spectrogram of shape [B, C, freq_bins, time_frames]:
+    - Divides along time axis with stride=patch_size
+    - Each patch has shape [freq_bins * patch_size * C] 
+    - Number of patches = time_frames // patch_size
+    
+    This preserves the full frequency resolution in each patch, which is 
+    beneficial for audio as frequency bins are semantically coupled.
+    """
+    def __init__(self, freq_bins=64, time_frames=64, patch_size=8, in_chans=1, 
+                 pca_dim=768, embed_dim=768, bias=True):
+        super().__init__()
+        self.freq_bins = freq_bins
+        self.time_frames = time_frames
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        self.num_patches = time_frames // patch_size
+        
+        # Each patch covers [freq_bins, patch_size] -> flatten to [freq_bins * patch_size * in_chans]
+        patch_dim = freq_bins * patch_size * in_chans
+        
+        # Two-stage projection with bottleneck (like BottleneckPatchEmbed)
+        # Use Conv1d treating time axis as the sequence dimension
+        # Input: [B, C * freq_bins, time_frames] -> kernel covers patch_size time steps
+        self.proj1 = nn.Conv1d(in_chans * freq_bins, pca_dim, kernel_size=patch_size, 
+                               stride=patch_size, bias=False)
+        self.proj2 = nn.Conv1d(pca_dim, embed_dim, kernel_size=1, stride=1, bias=bias)
+        
+    def forward(self, x):
+        """
+        x: [B, C, freq_bins, time_frames] - standard spectrogram format
+        Returns: [B, num_patches, embed_dim]
+        """
+        B, C, F, T = x.shape
+        assert F == self.freq_bins and T == self.time_frames, \
+            f"Input shape ({F}, {T}) doesn't match model ({self.freq_bins}, {self.time_frames})."
+        
+        # Reshape to [B, C * freq_bins, time_frames] for Conv1d along time axis
+        x = x.reshape(B, C * F, T)
+        
+        # Apply projections: [B, C*F, T] -> [B, pca_dim, num_patches] -> [B, embed_dim, num_patches]
+        x = self.proj2(self.proj1(x))
+        
+        # Transpose to [B, num_patches, embed_dim]
+        x = x.transpose(1, 2)
+        return x
+
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -210,6 +261,33 @@ class FinalLayer(nn.Module):
         return x
 
 
+class SpectrumFinalLayer(nn.Module):
+    """
+    Final layer for spectrum mode - outputs [freq_bins * patch_size * out_channels] per patch.
+    """
+    def __init__(self, hidden_size, freq_bins, patch_size, out_channels):
+        super().__init__()
+        self.freq_bins = freq_bins
+        self.patch_size = patch_size
+        self.out_channels = out_channels
+        
+        self.norm_final = RMSNorm(hidden_size)
+        # Output dimension: freq_bins * patch_size * channels
+        out_dim = freq_bins * patch_size * out_channels
+        self.linear = nn.Linear(hidden_size, out_dim, bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
+
+    @torch.compile
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+
 class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
@@ -235,6 +313,11 @@ class JiTBlock(nn.Module):
 class JiT(nn.Module):
     """
     Just image Transformer.
+    
+    Modes:
+    - is_1d=False, is_spectrum=False: Standard 2D image patchification (default)  
+    - is_1d=True: 1D signal patchification (for raw audio)
+    - is_spectrum=True: Spectrum patchification (patches along time axis only, preserves full frequency)
     """
     def __init__(
         self,
@@ -251,10 +334,16 @@ class JiT(nn.Module):
         bottleneck_dim=128,
         in_context_len=32,
         in_context_start=8,
-        is_1d=False
+        is_1d=False,
+        is_spectrum=False,
+        freq_bins=64,  # For spectrum mode: number of frequency bins
+        time_frames=64  # For spectrum mode: number of time frames
     ):
         super().__init__()
         self.is_1d = is_1d
+        self.is_spectrum = is_spectrum
+        self.freq_bins = freq_bins
+        self.time_frames = time_frames
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.patch_size = patch_size
@@ -269,8 +358,21 @@ class JiT(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
 
-        # linear embed
-        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True, is_1d=is_1d)
+        # linear embed - choose based on mode
+        if is_spectrum:
+            self.x_embedder = SpectrumPatchEmbed(
+                freq_bins=freq_bins, 
+                time_frames=time_frames,
+                patch_size=patch_size, 
+                in_chans=in_channels, 
+                pca_dim=bottleneck_dim, 
+                embed_dim=hidden_size, 
+                bias=True
+            )
+        else:
+            self.x_embedder = BottleneckPatchEmbed(
+                input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True, is_1d=is_1d
+            )
 
         # use fixed sin-cos embedding
         num_patches = self.x_embedder.num_patches
@@ -281,24 +383,26 @@ class JiT(nn.Module):
             self.in_context_posemb = nn.Parameter(torch.zeros(1, self.in_context_len, hidden_size), requires_grad=True)
             torch.nn.init.normal_(self.in_context_posemb, std=.02)
 
-        # rope
+        # rope - for spectrum mode, use 1D rope since we only have sequence along time
         half_head_dim = hidden_size // num_heads // 2
-        if is_1d:
+        if is_1d or is_spectrum:
             hw_seq_len = num_patches
+            rope_is_1d = True
         else:
             hw_seq_len = input_size // patch_size
+            rope_is_1d = False
             
         self.feat_rope = VisionRotaryEmbeddingFast(
             dim=half_head_dim,
             pt_seq_len=hw_seq_len,
             num_cls_token=0,
-            is_1d=is_1d
+            is_1d=rope_is_1d
         )
         self.feat_rope_incontext = VisionRotaryEmbeddingFast(
             dim=half_head_dim,
             pt_seq_len=hw_seq_len,
             num_cls_token=self.in_context_len,
-            is_1d=is_1d
+            is_1d=rope_is_1d
         )
 
         # transformer
@@ -309,8 +413,11 @@ class JiT(nn.Module):
             for i in range(depth)
         ])
 
-        # linear predict
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, is_1d=is_1d)
+        # linear predict - choose based on mode
+        if is_spectrum:
+            self.final_layer = SpectrumFinalLayer(hidden_size, freq_bins, patch_size, self.out_channels)
+        else:
+            self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, is_1d=is_1d)
 
         self.initialize_weights()
 
@@ -324,7 +431,8 @@ class JiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        if self.is_1d:
+        if self.is_1d or self.is_spectrum:
+            # 1D positional embedding for raw audio or spectrum mode
             pos_embed = get_1d_sincos_pos_embed_from_grid(self.pos_embed.shape[-1], np.arange(self.x_embedder.num_patches, dtype=np.float32))
         else:
             pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
@@ -357,14 +465,39 @@ class JiT(nn.Module):
 
     def unpatchify(self, x, p):
         """
-        x: (N, T, patch_size**2 * C) or (N, T, patch_size * C)
-        imgs: (N, H, W, C) or (N, 1, L)
+        Reconstruct the original spatial structure from patch sequence.
+        
+        Args:
+            x: Patch sequence with output dimensions
+               - 2D mode: (N, T, patch_size**2 * C) where T = (H/p) * (W/p)
+               - 1D mode: (N, T, patch_size * C) where T = L/p
+               - Spectrum mode: (N, T, freq_bins * patch_size * C) where T = time_frames/p
+            p: patch_size
+            
+        Returns:
+            - 2D mode: (N, C, H, W)
+            - 1D mode: (N, C, L)
+            - Spectrum mode: (N, C, freq_bins, time_frames)
         """
         c = self.out_channels
         
-        if self.is_1d:
+        if self.is_spectrum:
+            # x: [N, T, freq_bins * patch_size * C]
+            # output: [N, C, freq_bins, time_frames]
+            f = self.freq_bins
+            num_time_patches = x.shape[1]  # T = time_frames / patch_size
+            
+            # Reshape: [N, T, f*p*c] -> [N, T, f, p, c]
+            x = x.reshape(x.shape[0], num_time_patches, f, p, c)
+            
+            # Rearrange: [N, T, f, p, c] -> [N, c, f, T, p] -> [N, c, f, T*p]
+            x = x.permute(0, 4, 2, 1, 3)  # [N, c, f, T, p]
+            x = x.reshape(x.shape[0], c, f, num_time_patches * p)  # [N, c, f, time_frames]
+            
+            return x
+        elif self.is_1d:
             # x: [N, T, p*c]
-            # output: [N, 1, L]
+            # output: [N, c, L]
             # reshape to [N, T, p, c] -> [N, c, T, p] -> [N, c, L]
             x = x.reshape(shape=(x.shape[0], x.shape[1], p, c))
             x = torch.einsum('ntpc->nctp', x)
