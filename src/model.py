@@ -144,16 +144,38 @@ class TimestepEmbedder(nn.Module):
 
 class LabelEmbedder(nn.Module):
     """
-    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
+    Embeds class labels into vector representations. 
+    Supports label dropout for classifier-free guidance (CFG).
+    
+    The embedding table has num_classes + 1 entries, where the last entry
+    (index = num_classes) is the null/unconditional token used for CFG.
     """
     def __init__(self, num_classes, hidden_size):
         super().__init__()
         self.embedding_table = nn.Embedding(num_classes + 1, hidden_size)
         self.num_classes = num_classes
+        self.null_token_idx = num_classes  # Index for unconditional embedding
 
-    def forward(self, labels):
+    def forward(self, labels, drop_labels=None):
+        """
+        Args:
+            labels: Class labels [B]
+            drop_labels: Optional boolean mask [B] indicating which labels to drop.
+                        If None, no labels are dropped.
+        Returns:
+            embeddings: Label embeddings [B, hidden_size]
+        """
+        if drop_labels is not None:
+            # Replace dropped labels with null token index
+            labels = labels.clone()
+            labels[drop_labels] = self.null_token_idx
         embeddings = self.embedding_table(labels)
         return embeddings
+    
+    def get_null_embedding(self, batch_size, device):
+        """Get null embeddings for CFG unconditional generation."""
+        null_labels = torch.full((batch_size,), self.null_token_idx, dtype=torch.long, device=device)
+        return self.embedding_table(null_labels)
 
 
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
@@ -570,15 +592,19 @@ class JiT(nn.Module):
             imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
             return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, drop_labels=None):
         """
-        x: (N, C, H, W)
-        t: (N,)
-        y: (N,)
+        Forward pass with optional label dropout for CFG training.
+        
+        Args:
+            x: (N, C, H, W) or (N, C, L) depending on mode
+            t: (N,) timesteps
+            y: (N,) class labels
+            drop_labels: Optional (N,) boolean mask for CFG training
         """
         # class and time embeddings
         t_emb = self.t_embedder(t)
-        y_emb = self.y_embedder(y)
+        y_emb = self.y_embedder(y, drop_labels=drop_labels)
         c = t_emb + y_emb
 
         # forward JiT
@@ -599,6 +625,35 @@ class JiT(nn.Module):
         output = self.unpatchify(x, self.patch_size)
 
         return output
+    
+    def forward_with_cfg(self, x, t, y, cfg_scale=1.0):
+        """
+        Forward pass with Classifier-Free Guidance for inference.
+        
+        CFG formula: output = uncond + cfg_scale * (cond - uncond)
+        
+        Args:
+            x: Input tensor
+            t: Timesteps
+            y: Class labels
+            cfg_scale: Guidance scale (1.0 = no guidance)
+            
+        Returns:
+            CFG-guided output
+        """
+        if cfg_scale == 1.0:
+            return self.forward(x, t, y)
+        
+        # Conditional prediction
+        out_cond = self.forward(x, t, y)
+        
+        # Unconditional prediction (using null token)
+        batch_size = x.shape[0]
+        drop_all = torch.ones(batch_size, dtype=torch.bool, device=x.device)
+        out_uncond = self.forward(x, t, y, drop_labels=drop_all)
+        
+        # CFG combination
+        return out_uncond + cfg_scale * (out_cond - out_uncond)
 
 
 def JiT_B_16(**kwargs):

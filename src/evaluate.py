@@ -38,7 +38,20 @@ def load_vocoder(device='cuda'):
 
 
 
-def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0):
+def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0):
+    """
+    Generate samples using Flow Matching with optional Classifier-Free Guidance.
+    
+    Args:
+        model: The JiT model
+        num_samples: Number of samples to generate
+        steps: Number of sampling steps
+        device: Device to use
+        dataset_mode: 'raw', 'spectrogram', or 'spectrum_1d'
+        pred_mode: Prediction mode ('epsilon', 'x', 'v', etc.)
+        noise_scale: Scale for initial noise
+        cfg_scale: CFG guidance scale (1.0 = no guidance, >1.0 = stronger guidance)
+    """
     model.eval()
     
     if dataset_mode == 'raw':
@@ -62,41 +75,16 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
             
             # Model input t in [0, 1] (raw, not scaled)
             with autocast(enabled=(device!='cpu')):
-                model_out = model(z, t_batch, y)
+                if cfg_scale > 1.0:
+                    # CFG: Run model twice (conditional and unconditional)
+                    model_out = model.forward_with_cfg(z, t_batch, y, cfg_scale=cfg_scale)
+                else:
+                    model_out = model(z, t_batch, y)
             
-            # Calculate v
-            # z_t = t * x + (1-t) * eps
-            # v = x - eps
-            
-            # Calculate v
-            # z_t = t * x + (1-t) * eps
-            # v = x - eps
-            
+            # Calculate v based on prediction mode
             if pred_mode == 'epsilon' or pred_mode == 'epsilon_epsilon_loss':
                 eps = model_out
-                # x = (z - (1-t)*eps) / t
-                # This is unstable at t=0.
-                # But we only need v.
-                # v = (z - eps) / t - eps ? No.
-                # v = x - eps.
-                # z = t(x) + (1-t)eps = t(v+eps) + (1-t)eps = tv + eps.
-                # => v = (z - eps) / t.
-                # Still unstable at t=0.
-                
-                # Alternative:
-                # z_{t+dt} = z_t + v * dt
-                # If we use standard DDIM/DDPM sampling, it's different.
-                # But for Flow Matching:
-                # We need v.
-                # If we predict eps, we are essentially predicting the "noise" component.
-                # At t=0, z=eps. So model(z, 0) should predict z.
-                # v = (z - eps) / t is correct for Flow Matching.
-                # We can clip t to avoid division by zero: max(t, 1e-5).
-                
-                # Use a larger epsilon for stability or conditional check
-                # At t=0, v is undefined if we just divide. 
-                # But we can assume v is large or just clamp t.
-                # Create proper view shape for broadcasting: [B] -> [B, 1, ...] matching z's dimensions
+                # v = (z - eps) / t for Flow Matching
                 view_shape = [t_batch.shape[0]] + [1] * (z.dim() - 1)
                 t_view = t_batch.view(*view_shape)
                 v = (z - eps) / torch.maximum(t_view, torch.tensor(1e-3, device=device))
@@ -104,17 +92,11 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
             elif pred_mode == 'x' or pred_mode == 'x_v_loss':
                 x = model_out
                 # v = (x - z_t) / (1 - t)
-                # Note: t is in [0, 1].
-                # At t=1, 1-t=0. We need to clip.
-                # Create proper view shape for broadcasting: [B] -> [B, 1, ...] matching z's dimensions
                 view_shape = [t_batch.shape[0]] + [1] * (z.dim() - 1)
                 t_view = t_batch.view(*view_shape)
                 v = (x - z) / torch.maximum(1 - t_view, torch.tensor(1e-5, device=device))
                 
             elif pred_mode == 'v' or pred_mode == 'v_v_loss':
-                # WARNING: This assumes model outputs v directly.
-                # If trained with loss_type='v' in train.py, the model actually predicts x!
-                # Use pred_mode='x' for models trained with loss_type='v'.
                 v = model_out
             
             z = z + v * dt
@@ -215,6 +197,10 @@ if __name__ == "__main__":
     parser.add_argument('--freq_bins', type=int, default=64, help='Number of frequency bins (for spectrum_1d mode)')
     parser.add_argument('--time_frames', type=int, default=64, help='Number of time frames (for spectrum_1d mode)')
     
+    # Classifier-Free Guidance
+    parser.add_argument('--cfg_scale', type=float, default=1.0,
+                        help='CFG guidance scale (1.0 = no guidance, recommended: 3.0-5.0 for sharper outputs)')
+    
     args = parser.parse_args()
     
     # Load Model - determine configuration based on dataset_mode
@@ -258,9 +244,14 @@ if __name__ == "__main__":
     state_dict = torch.load(args.checkpoint, map_location=args.device)
     model.load_state_dict(state_dict)
     
-    print("Generating samples...")
+    if args.cfg_scale > 1.0:
+        print(f"Generating samples with CFG scale={args.cfg_scale}...")
+    else:
+        print("Generating samples...")
     samples = sample(model, args.num_samples, dataset_mode=args.dataset_mode, 
-                    pred_mode=args.pred_mode, noise_scale=args.noise_scale, device=args.device)
+                    pred_mode=args.pred_mode, noise_scale=args.noise_scale, 
+                    device=args.device, cfg_scale=args.cfg_scale)
     
     save_audio(samples, args.dataset_mode, args.output_dir, device=args.device)
     print(f"Saved to {args.output_dir}")
+

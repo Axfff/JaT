@@ -1,5 +1,6 @@
 import os
 import argparse
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +12,25 @@ import numpy as np
 
 from dataset import get_dataloader
 from model import JiT, JiT_models
+
+
+# --- Cosine Schedule for t sampling ---
+def cosine_schedule(t, s=0.008):
+    """
+    Cosine schedule that transforms uniform t to concentrate samples near t=0.
+    
+    This focuses more training on the "high-fidelity" regime (near t=0),
+    forcing the model to learn how to clean up the final layer of noise.
+    
+    Args:
+        t: Uniformly sampled timesteps in [0, 1]
+        s: Small offset to prevent singularity at t=0 (default: 0.008)
+        
+    Returns:
+        Rescaled t values concentrated near 0
+    """
+    # Cosine schedule: more samples near t=0 (clean data)
+    return torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
 
 
 # --- Multi-Scale Spectral Loss for Audio ---
@@ -26,12 +46,15 @@ class MultiScaleSpectralLoss(nn.Module):
         fft_sizes: List of FFT window sizes to use (default: [512, 1024, 2048])
         hop_ratio: Hop length as ratio of FFT size (default: 0.25)
         weight: Weight for the spectral loss term (default: 0.1)
+        use_log: If True, compute loss on log-magnitude (reduces penalty on loud signals)
     """
-    def __init__(self, fft_sizes=[512, 1024, 2048], hop_ratio=0.25, weight=0.1):
+    def __init__(self, fft_sizes=[512, 1024, 2048], hop_ratio=0.25, weight=0.1, use_log=False):
         super().__init__()
         self.fft_sizes = fft_sizes
         self.hop_ratio = hop_ratio
         self.weight = weight
+        self.use_log = use_log
+        self.eps = 1e-7  # Small constant for log stability
         
     def forward(self, pred_wave, target_wave):
         """
@@ -69,6 +92,12 @@ class MultiScaleSpectralLoss(nn.Module):
                 window=torch.hann_window(fft_size, device=target_wave.device),
                 return_complex=True
             ).abs()
+            
+            if self.use_log:
+                # Log-scale spectral loss: reduces penalty on loud signals,
+                # balances training across frequencies
+                pred_spec = torch.log(pred_spec + self.eps)
+                target_spec = torch.log(target_spec + self.eps)
             
             # L1 loss on magnitude (ignores phase misalignment)
             loss += F.l1_loss(pred_spec, target_spec)
@@ -193,6 +222,18 @@ def train(args):
         mock=args.mock
     )
     
+    # Validation dataloader (SpeechCommands validation_list.txt is speaker-disjoint)
+    val_dataloader = None
+    if not args.mock:
+        val_dataloader = get_dataloader(
+            args.data_root,
+            mode=args.dataset_mode,
+            batch_size=args.batch_size,
+            subset='validation',
+            mock=False
+        )
+        print(f"Loaded {len(val_dataloader.dataset)} validation samples (speaker-disjoint)")
+    
     # Model
     print(f"Creating model: Patch={args.patch_size}, Loss={args.loss_type}, Mode={args.dataset_mode}")
     # Determine input channels and size based on mode
@@ -270,9 +311,11 @@ def train(args):
     if args.use_spectral_loss and args.dataset_mode == 'raw':
         spectral_loss_fn = MultiScaleSpectralLoss(
             fft_sizes=[512, 1024, 2048],
-            weight=args.spectral_loss_weight
+            weight=args.spectral_loss_weight,
+            use_log=args.spectral_log_scale
         )
-        print(f"Using Multi-Scale Spectral Loss with weight={args.spectral_loss_weight}")
+        log_msg = "log-scale" if args.spectral_log_scale else "linear-scale"
+        print(f"Using Multi-Scale Spectral Loss ({log_msg}) with weight={args.spectral_loss_weight}")
     
     model.train()
     
@@ -290,14 +333,19 @@ def train(args):
         except:
             print("Could not parse epoch from checkpoint name, starting from next epoch if possible or 0")
             
-    # Logging
+    # Logging - with separate loss components
     log_file = os.path.join('checkpoints', f'training_log_{args.experiment_name}.csv')
+    os.makedirs('checkpoints', exist_ok=True)
     with open(log_file, 'w') as f:
-        f.write('epoch,step,loss\n')
+        # Header includes separate loss components for when spectral loss is enabled
+        f.write('epoch,split,step,loss_time,loss_spec,loss_total\n')
             
     for epoch in range(start_epoch, args.epochs):
+        model.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        epoch_loss = 0.0
+        epoch_loss_time = 0.0
+        epoch_loss_spec = 0.0
+        epoch_loss_total = 0.0
         steps = 0
         for i, (x, y) in enumerate(pbar):
             x = x.to(device)
@@ -314,13 +362,22 @@ def train(args):
             z = torch.randn(x.shape[0], device=device) * args.P_std + args.P_mean
             t = torch.sigmoid(z)
             
+            # Apply schedule transformation if using cosine schedule
+            if args.schedule_type == 'cosine':
+                t = cosine_schedule(t)
+            
+            # CFG: Label dropout (randomly drop labels with probability label_dropout)
+            drop_labels = None
+            if args.label_dropout > 0:
+                drop_labels = torch.rand(x.shape[0], device=device) < args.label_dropout
+            
             # Forward process
             noise = torch.randn_like(x) * args.noise_scale
             z_t, _ = flow.q_sample(x, t, noise)
             
             # Model prediction (pass raw t in [0, 1], not scaled)
             with autocast(enabled=args.fp16):
-                model_output = model(z_t, t, y)
+                model_output = model(z_t, t, y, drop_labels=drop_labels)
             
                 # Validate output shape matches input shape
                 if model_output.shape != x.shape:
@@ -375,10 +432,11 @@ def train(args):
                     
                     # 7. Add Multi-Scale Spectral Loss for raw audio (if enabled)
                     # This guides the model to preserve high-frequency content
+                    loss_spec = torch.tensor(0.0, device=device)
                     if spectral_loss_fn is not None:
                         # Spectral loss on predicted clean audio vs target clean audio
-                        loss_freq = spectral_loss_fn(x_pred.float(), x.float())
-                        loss = loss_time + loss_freq
+                        loss_spec = spectral_loss_fn(x_pred.float(), x.float())
+                        loss = loss_time + loss_spec
                     else:
                         loss = loss_time
                 else:
@@ -406,17 +464,101 @@ def train(args):
             scaler.step(optimizer)
             scaler.update()
             
-            pbar.set_postfix({'loss': loss.item()})
-            epoch_loss += loss.item()
+            # Track separate losses
+            loss_time_val = loss_time.item() if isinstance(loss_time, torch.Tensor) else loss_time
+            loss_spec_val = loss_spec.item() if isinstance(loss_spec, torch.Tensor) else loss_spec
+            loss_total_val = loss.item()
+            
+            pbar.set_postfix({
+                'loss': loss_total_val,
+                'time': loss_time_val,
+                'spec': loss_spec_val if spectral_loss_fn else 0.0
+            })
+            epoch_loss_time += loss_time_val
+            epoch_loss_spec += loss_spec_val
+            epoch_loss_total += loss_total_val
             steps += 1
             
-            # Log step loss
+            # Log step loss (every 100 steps to reduce I/O)
+            if i % 100 == 0:
+                with open(log_file, 'a') as f:
+                    f.write(f'{epoch},train,{i},{loss_time_val:.6f},{loss_spec_val:.6f},{loss_total_val:.6f}\n')
+        
+        # End of epoch - log average training loss
+        if steps > 0:
+            avg_train_time = epoch_loss_time / steps
+            avg_train_spec = epoch_loss_spec / steps
+            avg_train_total = epoch_loss_total / steps
             with open(log_file, 'a') as f:
-                f.write(f'{epoch},{i},{loss.item()}\n')
+                f.write(f'{epoch},train_avg,-1,{avg_train_time:.6f},{avg_train_spec:.6f},{avg_train_total:.6f}\n')
+            print(f"\nEpoch {epoch+1} Train - Total: {avg_train_total:.4f}, Time: {avg_train_time:.4f}, Spec: {avg_train_spec:.4f}")
+        
+        # Validation loop
+        if val_dataloader is not None:
+            model.eval()
+            val_loss_time = 0.0
+            val_loss_spec = 0.0
+            val_loss_total = 0.0
+            val_steps = 0
+            
+            with torch.no_grad():
+                for x, y in tqdm(val_dataloader, desc=f"Validation", leave=False):
+                    x = x.to(device)
+                    y = y.to(device)
+                    
+                    # If spectrogram or spectrum_1d, ensure [B, 1, 64, 64]
+                    if args.dataset_mode in ['spectrogram', 'spectrum_1d']:
+                        if x.dim() == 3:
+                            x = x.unsqueeze(1)
+                    
+                    # Sample t (use same distribution as training for fair comparison)
+                    z_val = torch.randn(x.shape[0], device=device) * args.P_std + args.P_mean
+                    t = torch.sigmoid(z_val)
+                    if args.schedule_type == 'cosine':
+                        t = cosine_schedule(t)
+                    
+                    # Forward process
+                    noise = torch.randn_like(x) * args.noise_scale
+                    z_t, _ = flow.q_sample(x, t, noise)
+                    
+                    # Model prediction (no label dropout for validation)
+                    with autocast(enabled=args.fp16):
+                        model_output = model(z_t, t, y)
+                    
+                    # Compute validation loss (x_v_loss style for x-prediction models)
+                    if args.loss_type == 'x_v_loss':
+                        x_pred = model_output
+                        t_view = t.view(*([t.shape[0]] + [1] * (x.dim() - 1)))
+                        denominator = torch.clamp((1 - t_view).float(), min=0.1)
+                        v_pred = torch.clamp((x_pred.float() - z_t.float()) / denominator, -100.0, 100.0)
+                        v_target = x - noise
+                        batch_loss_time = F.mse_loss(v_pred.float(), v_target.float())
+                        
+                        batch_loss_spec = torch.tensor(0.0, device=device)
+                        if spectral_loss_fn is not None:
+                            batch_loss_spec = spectral_loss_fn(x_pred.float(), x.float())
+                        batch_loss_total = batch_loss_time + batch_loss_spec
+                    else:
+                        # For other loss types, use simple MSE
+                        batch_loss_time = F.mse_loss(model_output, x if args.loss_type != 'epsilon_epsilon_loss' else noise)
+                        batch_loss_spec = torch.tensor(0.0, device=device)
+                        batch_loss_total = batch_loss_time
+                    
+                    val_loss_time += batch_loss_time.item()
+                    val_loss_spec += batch_loss_spec.item()
+                    val_loss_total += batch_loss_total.item()
+                    val_steps += 1
+            
+            if val_steps > 0:
+                avg_val_time = val_loss_time / val_steps
+                avg_val_spec = val_loss_spec / val_steps
+                avg_val_total = val_loss_total / val_steps
+                with open(log_file, 'a') as f:
+                    f.write(f'{epoch},val,-1,{avg_val_time:.6f},{avg_val_spec:.6f},{avg_val_total:.6f}\n')
+                print(f"Epoch {epoch+1} Val   - Total: {avg_val_total:.4f}, Time: {avg_val_time:.4f}, Spec: {avg_val_spec:.4f}")
             
         # Save checkpoint
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            os.makedirs('checkpoints', exist_ok=True)
             torch.save(model.state_dict(), f'checkpoints/model_{args.experiment_name}_ep{epoch+1}.pth')
 
 if __name__ == "__main__":
@@ -444,6 +586,14 @@ if __name__ == "__main__":
     parser.add_argument('--t_eps', type=float, default=5e-2, help='Minimum t value to avoid division by zero')
     parser.add_argument('--fp16', action='store_true', default=True, help='Enable mixed precision training')
     
+    # Schedule type
+    parser.add_argument('--schedule_type', type=str, default='linear', choices=['linear', 'cosine'],
+                        help='Noise schedule type: linear (default) or cosine (focuses on high-fidelity regime)')
+    
+    # Classifier-Free Guidance (CFG)
+    parser.add_argument('--label_dropout', type=float, default=0.0,
+                        help='Label dropout probability for CFG training (default: 0.0, recommended: 0.1)')
+    
     # Audio-specific improvements
     parser.add_argument('--use_snake', action='store_true', default=False, 
                         help='Use Snake activation for better audio periodicity (recommended for raw audio)')
@@ -451,6 +601,9 @@ if __name__ == "__main__":
                         help='Add multi-scale spectral loss for raw audio (guides high-frequency preservation)')
     parser.add_argument('--spectral_loss_weight', type=float, default=0.1,
                         help='Weight for spectral loss term (default: 0.1)')
+    parser.add_argument('--spectral_log_scale', action='store_true', default=False,
+                        help='Use log-scale spectral loss (balances training across frequencies)')
     
     args = parser.parse_args()
     train(args)
+
