@@ -263,30 +263,46 @@ def train(args):
                     
                     # 3. CRITICAL: The paper clips the denominator to avoid explosion at t=1
                     # See paper: "clip its denominator (by default, 0.05)"
-                    denominator = 1 - t_view
-                    denominator = torch.clamp(denominator, min=0.05) 
+                    # FP16 FIX: Use a larger min value and compute in float32 for stability
+                    denominator = (1 - t_view).float()
+                    denominator = torch.clamp(denominator, min=0.1)  # Larger min for FP16 stability
                     
                     # 4. Calculate Velocity Prediction (Formula from Eq. 6)
                     # v_pred = (x_pred - z_t) / (1 - t)
-                    v_pred = (x_pred - z_t) / denominator
+                    # FP16 FIX: Compute in float32 then convert back, and clamp to prevent overflow
+                    v_pred = ((x_pred.float() - z_t.float()) / denominator)
+                    v_pred = torch.clamp(v_pred, min=-100.0, max=100.0)  # Prevent extreme values
+                    v_pred = v_pred.to(x_pred.dtype)
                     
                     # 5. Calculate Ground Truth Velocity
                     # It is cleaner to use (x - noise) than deriving it from z_t
                     # v = x - epsilon [cite: 120]
                     v_target = x - noise
                     
-                    # 6. Compute Loss
-                    loss = F.mse_loss(v_pred, v_target)
+                    # 6. Compute Loss (in float32 for numerical stability)
+                    loss = F.mse_loss(v_pred.float(), v_target.float())
                 else:
                     raise ValueError(f"Unknown loss type: {args.loss_type}")
             
             # FP16 Backward Pass
             optimizer.zero_grad()
             
+            # Check for NaN/Inf in loss and skip batch if found
+            if not torch.isfinite(loss):
+                print(f"WARNING: Non-finite loss detected ({loss.item()}), skipping batch")
+                scaler.update()  # Still update scaler to maintain its state
+                continue
+            
             # Scale loss and backward
             scaler.scale(loss).backward()
             
-            # Unscale and step
+            # Unscale gradients before clipping
+            scaler.unscale_(optimizer)
+            
+            # Gradient clipping to prevent exploding gradients (critical for FP16)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Step optimizer (will skip if gradients contain inf/nan)
             scaler.step(optimizer)
             scaler.update()
             

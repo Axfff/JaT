@@ -106,17 +106,31 @@ class LabelEmbedder(nn.Module):
 
 
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
+    """
+    Scaled dot-product attention with FP16-safe computation.
+    Attention weights are computed in float32 to prevent overflow in softmax.
+    """
+    original_dtype = query.dtype
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype, device=query.device)
 
-    # with torch.cuda.amp.autocast(enabled=False): # Disable for now or use generic autocast if needed
-    if True:
-        attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
+    # Compute attention in float32 for numerical stability with FP16
+    query_f32 = query.float()
+    key_f32 = key.float()
+    value_f32 = value.float()
+    
+    attn_weight = query_f32 @ key_f32.transpose(-2, -1) * scale_factor
+    
+    # Clamp attention logits to prevent overflow in softmax
+    attn_weight = torch.clamp(attn_weight, min=-65504.0, max=65504.0)
+    
     attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-    return attn_weight @ value
+    
+    output = attn_weight @ value_f32
+    
+    # Return in original dtype
+    return output.to(original_dtype)
 
 
 class Attention(nn.Module):
