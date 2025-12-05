@@ -43,8 +43,11 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
     
     if dataset_mode == 'raw':
         shape = (num_samples, 1, 16384)
-    else:
+    elif dataset_mode in ['spectrogram', 'spectrum_1d']:
+        # Both spectrogram and spectrum_1d use 64x64 mel spectrograms
         shape = (num_samples, 1, 64, 64)
+    else:
+        raise ValueError(f"Unknown dataset_mode: {dataset_mode}")
         
     z = torch.randn(shape, device=device) * noise_scale
     ts = torch.linspace(0, 1, steps, device=device)
@@ -196,7 +199,7 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='results')
     parser.add_argument('--num_samples', type=int, default=16)
-    parser.add_argument('--dataset_mode', type=str, default='raw')
+    parser.add_argument('--dataset_mode', type=str, default='raw', choices=['raw', 'spectrogram', 'spectrum_1d'])
     parser.add_argument('--pred_mode', type=str, default='x', choices=['epsilon', 'x', 'v', 'epsilon_epsilon_loss', 'v_v_loss', 'x_v_loss'])
     parser.add_argument('--patch_size', type=int, default=512)
     parser.add_argument('--noise_scale', type=float, default=1.0, help='Noise scale factor')
@@ -206,15 +209,32 @@ if __name__ == "__main__":
     parser.add_argument('--bottleneck_dim', type=int, default=None, help='Bottleneck dimension (default: hidden_size)')
     parser.add_argument('--in_context_len', type=int, default=0, help='In-context length')
     
+    # Audio-specific model parameters (must match training configuration)
+    parser.add_argument('--use_snake', action='store_true', default=False,
+                        help='Use Snake activation (must match training config)')
+    parser.add_argument('--freq_bins', type=int, default=64, help='Number of frequency bins (for spectrum_1d mode)')
+    parser.add_argument('--time_frames', type=int, default=64, help='Number of time frames (for spectrum_1d mode)')
+    
     args = parser.parse_args()
     
-    # Load Model
+    # Load Model - determine configuration based on dataset_mode
     if args.dataset_mode == 'raw':
         input_size = 16384
         in_channels = 1
-    else:
+        is_1d = True
+        is_spectrum = False
+    elif args.dataset_mode == 'spectrogram':
         input_size = 64
         in_channels = 1
+        is_1d = False
+        is_spectrum = False
+    elif args.dataset_mode == 'spectrum_1d':
+        input_size = 64
+        in_channels = 1
+        is_1d = False
+        is_spectrum = True
+    else:
+        raise ValueError(f"Unknown dataset_mode: {args.dataset_mode}")
         
     bottleneck_dim = args.bottleneck_dim if args.bottleneck_dim is not None else args.hidden_size
 
@@ -228,7 +248,11 @@ if __name__ == "__main__":
         num_classes=35,
         bottleneck_dim=bottleneck_dim,
         in_context_len=args.in_context_len,
-        is_1d=(args.dataset_mode == 'raw')
+        is_1d=is_1d,
+        is_spectrum=is_spectrum,
+        freq_bins=args.freq_bins,
+        time_frames=args.time_frames,
+        use_snake=args.use_snake
     ).to(args.device)
     
     state_dict = torch.load(args.checkpoint, map_location=args.device)
