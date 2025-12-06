@@ -337,7 +337,7 @@ def train(args):
             fft_sizes=[512, 1024, 2048],
             weight=args.spectral_loss_weight,
             use_log=args.spectral_log_scale
-        )
+        ).to(device)
         log_msg = "log-scale" if args.spectral_log_scale else "linear-scale"
         print(f"Using Multi-Scale Spectral Loss ({log_msg}) with weight={args.spectral_loss_weight}")
     
