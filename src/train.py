@@ -448,7 +448,7 @@ def train(args):
             # Check for NaN/Inf in loss and skip batch if found
             if not torch.isfinite(loss):
                 print(f"WARNING: Non-finite loss detected ({loss.item()}), skipping batch")
-                scaler.update()  # Still update scaler to maintain its state
+                # Don't call scaler.update() here - no gradient ops were done
                 continue
             
             # Scale loss and backward
