@@ -54,7 +54,9 @@ class MultiScaleSpectralLoss(nn.Module):
         self.hop_ratio = hop_ratio
         self.weight = weight
         self.use_log = use_log
-        self.eps = 1e-7  # Small constant for log stability
+        # INCREASED: 1e-7 -> 1e-5 for FP16 stability
+        # 1e-7 causes underflow in FP16 and gradient explosion (1/eps = 10M)
+        self.eps = 1e-5
         
     def forward(self, pred_wave, target_wave):
         """
@@ -96,8 +98,12 @@ class MultiScaleSpectralLoss(nn.Module):
             if self.use_log:
                 # Log-scale spectral loss: reduces penalty on loud signals,
                 # balances training across frequencies
-                pred_spec = torch.log(pred_spec + self.eps)
-                target_spec = torch.log(target_spec + self.eps)
+                # 
+                # FIX: Use clamp BEFORE log instead of log(x + eps)
+                # This guarantees gradient <= 1/eps, preventing explosion
+                # log(x + eps) can still have massive gradients when x is negative
+                pred_spec = torch.log(torch.clamp(pred_spec, min=self.eps))
+                target_spec = torch.log(torch.clamp(target_spec, min=self.eps))
             
             # L1 loss on magnitude (ignores phase misalignment)
             loss += F.l1_loss(pred_spec, target_spec)
