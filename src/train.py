@@ -54,10 +54,21 @@ class MultiScaleSpectralLoss(nn.Module):
         self.hop_ratio = hop_ratio
         self.weight = weight
         self.use_log = use_log
-        # INCREASED: 1e-5 -> 1e-4 for FP16 stability
-        # This limits max gradient to 10,000 (vs 100,000 for 1e-5)
-        # Critical for preventing gradient explosion with log-scale loss
-        self.eps = 1e-4
+        
+        # Adaptive epsilon: smaller FFT sizes need larger eps to prevent gradient explosion
+        # This is because smaller FFTs have less energy per bin (more spread out)
+        # eps is chosen so max gradient (1/eps) stays reasonable:
+        # - FFT 64-128: eps=1e-2 -> max grad 100
+        # - FFT 256: eps=5e-3 -> max grad 200  
+        # - FFT 512+: eps=1e-3 -> max grad 1000
+        self.eps_map = {}
+        for fft_size in fft_sizes:
+            if fft_size <= 128:
+                self.eps_map[fft_size] = 1e-2
+            elif fft_size <= 256:
+                self.eps_map[fft_size] = 5e-3
+            else:
+                self.eps_map[fft_size] = 1e-3
         
         # Pre-register windows as buffers to avoid recreation every forward pass
         # This also ensures they move to the correct device with the module
@@ -82,7 +93,6 @@ class MultiScaleSpectralLoss(nn.Module):
         
         # CRITICAL: Force float32 for STFT computation
         # STFT is numerically unstable in FP16 and can produce NaN/Inf
-        original_dtype = pred_wave.dtype
         pred_wave = pred_wave.float()
         target_wave = target_wave.float()
         
@@ -90,6 +100,7 @@ class MultiScaleSpectralLoss(nn.Module):
         for fft_size in self.fft_sizes:
             hop_length = int(fft_size * self.hop_ratio)
             window = getattr(self, f'window_{fft_size}')
+            eps = self.eps_map[fft_size]
             
             # Compute STFT magnitude (in float32)
             pred_spec = torch.stft(
@@ -108,20 +119,25 @@ class MultiScaleSpectralLoss(nn.Module):
                 return_complex=True
             ).abs()
             
+            # Normalize by sqrt(fft_size) to make magnitudes comparable across scales
+            # This compensates for the fact that smaller FFTs distribute energy differently
+            norm_factor = math.sqrt(fft_size / 2048.0)  # Normalize relative to largest FFT
+            pred_spec = pred_spec / norm_factor
+            target_spec = target_spec / norm_factor
+            
             if self.use_log:
                 # Log-scale spectral loss: reduces penalty on loud signals,
                 # balances training across frequencies
                 # 
-                # FP16 SAFETY: 
-                # 1. Clamp input to eps before log (limits gradient to 1/eps = 10,000)
-                # 2. Clamp output to reasonable range to prevent extreme values
-                pred_spec = torch.log(torch.clamp(pred_spec, min=self.eps))
-                target_spec = torch.log(torch.clamp(target_spec, min=self.eps))
+                # SAFETY MEASURES:
+                # 1. Use adaptive eps per FFT size (smaller FFT = larger eps)
+                # 2. Clamp output to reasonable range
+                pred_spec = torch.log(torch.clamp(pred_spec, min=eps))
+                target_spec = torch.log(torch.clamp(target_spec, min=eps))
                 
                 # Clamp log output to prevent extreme values that could overflow
-                # log(1e-4) ≈ -9.2, log(1e3) ≈ 6.9, so [-15, 10] is safe range
-                pred_spec = torch.clamp(pred_spec, min=-15.0, max=10.0)
-                target_spec = torch.clamp(target_spec, min=-15.0, max=10.0)
+                pred_spec = torch.clamp(pred_spec, min=-10.0, max=10.0)
+                target_spec = torch.clamp(target_spec, min=-10.0, max=10.0)
             
             # L1 loss on magnitude (ignores phase misalignment)
             loss += F.l1_loss(pred_spec, target_spec)
@@ -243,7 +259,9 @@ def train(args):
         mode=args.dataset_mode, 
         batch_size=args.batch_size,
         subset='training',
-        mock=args.mock
+        mock=args.mock,
+        freq_bins=args.freq_bins,
+        time_frames=args.time_frames
     )
     
     # Validation dataloader (SpeechCommands validation_list.txt is speaker-disjoint)
@@ -254,7 +272,9 @@ def train(args):
             mode=args.dataset_mode,
             batch_size=args.batch_size,
             subset='validation',
-            mock=False
+            mock=False,
+            freq_bins=args.freq_bins,
+            time_frames=args.time_frames
         )
         print(f"Loaded {len(val_dataloader.dataset)} validation samples (speaker-disjoint)")
     
@@ -273,24 +293,23 @@ def train(args):
     elif args.dataset_mode == 'spectrogram':
         # Standard 2D spectrogram patchification (like image patches)
         # JiT expects square image input.
-        # Our spectrogram is 64x64.
-        input_size = 64
+        input_size = args.freq_bins  # Use freq_bins as input_size for patch calculations
         in_channels = 1
         patch_size = args.patch_size  # e.g. 16 or 8
         is_1d = False
         is_spectrum = False
-        freq_bins = None
-        time_frames = None
+        freq_bins = args.freq_bins
+        time_frames = args.time_frames
     elif args.dataset_mode == 'spectrum_1d':
         # New mode: Patch only along time axis, preserve full frequency resolution
         # Each patch covers [freq_bins, patch_size] -> better for audio
-        input_size = 64  # Not used for spectrum mode, but kept for compatibility
+        input_size = args.freq_bins  # Not used for spectrum mode, but kept for compatibility
         in_channels = 1
         patch_size = args.patch_size
         is_1d = False
         is_spectrum = True
-        freq_bins = 64  # Number of mel bins
-        time_frames = 64  # Number of time frames
+        freq_bins = args.freq_bins
+        time_frames = args.time_frames
     else:
         raise ValueError(f"Unknown dataset_mode: {args.dataset_mode}")
 
@@ -310,8 +329,8 @@ def train(args):
         in_context_len=0,  # Disable in-context for now unless specified
         is_1d=is_1d,
         is_spectrum=is_spectrum,
-        freq_bins=freq_bins if freq_bins else 64,
-        time_frames=time_frames if time_frames else 64,
+        freq_bins=freq_bins if freq_bins else args.freq_bins,
+        time_frames=time_frames if time_frames else args.time_frames,
         use_snake=args.use_snake  # Snake activation for audio periodicity
     ).to(device)
     
@@ -379,9 +398,9 @@ def train(args):
             x = x.to(device)
             y = y.to(device)
             
-            # If spectrogram or spectrum_1d, ensure [B, 1, 64, 64]
+            # If spectrogram or spectrum_1d, ensure [B, 1, freq_bins, time_frames]
             if args.dataset_mode in ['spectrogram', 'spectrum_1d']:
-                if x.dim() == 3:  # [B, 64, 64] -> [B, 1, 64, 64]
+                if x.dim() == 3:  # [B, F, T] -> [B, 1, F, T]
                     x = x.unsqueeze(1)
             
             # Sample t from logit-normal distribution (JiT-style)
@@ -413,7 +432,7 @@ def train(args):
                         f"Model output shape {model_output.shape} doesn't match input shape {x.shape}. "
                         f"This usually indicates a patch size issue. "
                         f"Patch size {args.patch_size} must divide evenly into input size "
-                        f"({'16384 for raw audio' if args.dataset_mode == 'raw' else '64 for spectrogram'})."
+                        f"({'16384 for raw audio' if args.dataset_mode == 'raw' else f'{args.freq_bins}x{args.time_frames} for spectrogram'})."
                     )
                 
                 # Loss
@@ -534,7 +553,7 @@ def train(args):
                     x = x.to(device)
                     y = y.to(device)
                     
-                    # If spectrogram or spectrum_1d, ensure [B, 1, 64, 64]
+                    # If spectrogram or spectrum_1d, ensure [B, 1, freq_bins, time_frames]
                     if args.dataset_mode in ['spectrogram', 'spectrum_1d']:
                         if x.dim() == 3:
                             x = x.unsqueeze(1)
@@ -606,6 +625,12 @@ if __name__ == "__main__":
     # Model Capacity
     parser.add_argument('--hidden_size', type=int, default=512, help='Model hidden size')
     parser.add_argument('--depth', type=int, default=12, help='Model depth (number of layers)')
+    
+    # Spectrum resolution (for spectrogram and spectrum_1d modes)
+    parser.add_argument('--freq_bins', type=int, default=64,
+                        help='Number of frequency bins for spectrogram/spectrum_1d (default: 64)')
+    parser.add_argument('--time_frames', type=int, default=64,
+                        help='Number of time frames for spectrogram/spectrum_1d (default: 64)')
     
     # JiT-style parameters
     parser.add_argument('--P_mean', type=float, default=-0.8, help='Logit-normal mean for time sampling')
