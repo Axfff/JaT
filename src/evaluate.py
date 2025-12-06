@@ -57,8 +57,8 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
     if dataset_mode == 'raw':
         shape = (num_samples, 1, 16384)
     elif dataset_mode in ['spectrogram', 'spectrum_1d']:
-        # Both spectrogram and spectrum_1d use 64x64 mel spectrograms
-        shape = (num_samples, 1, 64, 64)
+        # Both spectrogram and spectrum_1d use freq_bins x time_frames mel spectrograms
+        shape = (num_samples, 1, model.freq_bins, model.time_frames)
     else:
         raise ValueError(f"Unknown dataset_mode: {dataset_mode}")
         
@@ -126,13 +126,13 @@ def save_audio(batch, dataset_mode, output_dir, sample_rate=16000, device='cuda'
             # SpeechBrain HiFi-GAN expects log-mel spectrograms.
             # Our denormalize returns log-mel.
             
-            # Resize from 64 mels to 80 mels
-            # Input: [1, 64, T]
-            # We treat it as an image [1, 1, 64, T] for interpolation
+            # Resize from freq_bins mels to 80 mels
+            # Input: [1, freq_bins, T]
+            # We treat it as an image [1, 1, freq_bins, T] for interpolation
             spec_img = spec.unsqueeze(1) 
             
             # Interpolate
-            # Note: We want to preserve the time dimension T, and change 64 -> 80
+            # Note: We want to preserve the time dimension T, and change F -> 80
             # Target size: (80, T)
             T = spec.shape[-1]
             spec_80_img = torch.nn.functional.interpolate(spec_img, size=(80, T), mode='bilinear', align_corners=False)
@@ -153,7 +153,14 @@ def save_audio(batch, dataset_mode, output_dir, sample_rate=16000, device='cuda'
             if waveform is None:
                 # Fallback to Griffin-Lim (Legacy)
                 print("Falling back to Griffin-Lim...")
-                inv_mel = torchaudio.transforms.InverseMelScale(n_stft=1024 // 2 + 1, n_mels=64, sample_rate=sample_rate).to(device)
+                n_mels = spec.shape[-2] # Should be freq_bins
+                # n_stft assuming standard relation typically n_fft/2 + 1 >= n_mels. 
+                # If we used n_fft=1024 for 64 mels, for other mels we might need adjustment.
+                # But InverseMelScale needs to match what was used. 
+                # We can try to infer n_stft or just use a large enough one.
+                # Standard speech commands is 16k.
+                
+                inv_mel = torchaudio.transforms.InverseMelScale(n_stft=1024 // 2 + 1, n_mels=n_mels, sample_rate=sample_rate).to(device)
                 griffin_lim = torchaudio.transforms.GriffinLim(n_fft=1024, hop_length=256, n_iter=64, momentum=0.99).to(device)
                 
                 # Inverse log
@@ -210,12 +217,12 @@ if __name__ == "__main__":
         is_1d = True
         is_spectrum = False
     elif args.dataset_mode == 'spectrogram':
-        input_size = 64
+        input_size = args.freq_bins
         in_channels = 1
         is_1d = False
         is_spectrum = False
     elif args.dataset_mode == 'spectrum_1d':
-        input_size = 64
+        input_size = args.freq_bins
         in_channels = 1
         is_1d = False
         is_spectrum = True

@@ -53,7 +53,7 @@ def denormalize_spectrogram(norm_spec):
     return spec
 
 class SpeechCommandsDataset(Dataset):
-    def __init__(self, root, mode='raw', subset='training', download=True, mock=False):
+    def __init__(self, root, mode='raw', subset='training', download=True, mock=False, freq_bins=64, time_frames=64):
         """
         Args:
             root (str): Root directory for the dataset.
@@ -66,8 +66,11 @@ class SpeechCommandsDataset(Dataset):
         self.subset = subset
         self.sample_rate = 16000
         self.duration = 1.0 # seconds
+        self.duration = 1.0 # seconds
         self.num_samples = 16384 # Pad to multiple of 512 (32 * 512)
         self.mock = mock
+        self.freq_bins = freq_bins
+        self.time_frames = time_frames
         
         if self.mock:
             self.dataset = list(range(100)) # 100 mock samples
@@ -169,7 +172,7 @@ class SpeechCommandsDataset(Dataset):
             
             if self.mode in ['spectrogram', 'spectrum_1d']:
                  # Mock spectrogram
-                 spec = torch.randn(64, 64)
+                 spec = torch.randn(self.freq_bins, self.time_frames)
                  return spec, label_idx
             return waveform, label_idx
 
@@ -215,22 +218,30 @@ class SpeechCommandsDataset(Dataset):
         
         if self.mode in ['spectrogram', 'spectrum_1d']:
             # Convert to Mel Spectrogram (both modes use 2D spectrograms, differ in model patchification)
-            # Target: 64x64
-            # 16000 samples. 
-            # To get 64 time steps: hop_length = 16000 / 64 = 250.
-            # n_fft needs to be appropriate.
+            # Target: freq_bins x time_frames
+            
+            # Dynamically calculate settings
+            # n_fft depends on freq_bins (n_mels). 
+            # If freq_bins is large (e.g. 128), n_fft=1024 is fine (513 bins). 
+            # If freq_bins > 512, we might need larger n_fft.
+            n_fft = 2048 if self.freq_bins > 512 else 1024
+            
+            # Hop length to approximate time_frames
+            # We want roughly 'time_frames' columns.
+            hop_length = self.num_samples // self.time_frames
             
             mel_transform = torchaudio.transforms.MelSpectrogram(
                 sample_rate=self.sample_rate,
-                n_fft=1024,
-                hop_length=256, # 16000/256 = 62.5 -> approx 63 frames. Close to 64.
-                n_mels=64
+                n_fft=n_fft,
+                hop_length=hop_length, 
+                n_mels=self.freq_bins
             )
             spec = mel_transform(waveform)
-            # spec shape: [1, 64, T]
+            # spec shape: [1, freq_bins, T_actual]
             
-            # Resize to exactly 64x64 if needed
-            spec = F.interpolate(spec.unsqueeze(0), size=(64, 64), mode='bilinear', align_corners=False).squeeze(0)
+            # Resize to exactly freq_bins x time_frames
+            # We use interpolate to ensure exact dimensions regardless of rounding in STFT
+            spec = F.interpolate(spec.unsqueeze(0), size=(self.freq_bins, self.time_frames), mode='bilinear', align_corners=False).squeeze(0)
             
             # Log scaling usually helps
             spec = torch.log(spec + 1e-9)
@@ -242,8 +253,8 @@ class SpeechCommandsDataset(Dataset):
             
         return waveform, self.label_to_idx.get(label, 0)
 
-def get_dataloader(root, mode='raw', subset='training', batch_size=32, num_workers=4, mock=False):
-    dataset = SpeechCommandsDataset(root, mode=mode, subset=subset, mock=mock)
+def get_dataloader(root, mode='raw', subset='training', batch_size=32, num_workers=4, mock=False, freq_bins=64, time_frames=64):
+    dataset = SpeechCommandsDataset(root, mode=mode, subset=subset, mock=mock, freq_bins=freq_bins, time_frames=time_frames)
     
     # We need to collate labels properly because they are strings.
     # Or we can convert them to indices.
