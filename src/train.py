@@ -341,6 +341,10 @@ def train(args):
         f.write('epoch,split,step,loss_time,loss_spec,loss_total\n')
             
     for epoch in range(start_epoch, args.epochs):
+        # Clear GPU cache to prevent fragmentation (especially after validation)
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        
         model.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
         epoch_loss_time = 0.0
