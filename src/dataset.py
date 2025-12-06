@@ -167,7 +167,7 @@ class SpeechCommandsDataset(Dataset):
             label = "bed" # Mock label
             label_idx = self.label_to_idx.get(label, 0)
             
-            if self.mode == 'spectrogram':
+            if self.mode in ['spectrogram', 'spectrum_1d']:
                  # Mock spectrogram
                  spec = torch.randn(64, 64)
                  return spec, label_idx
@@ -213,8 +213,8 @@ class SpeechCommandsDataset(Dataset):
         # Normalize to [-1, 1] (Usually it is already float32 in [-1, 1] when loaded by torchaudio)
         # But let's ensure it.
         
-        if self.mode == 'spectrogram':
-            # Convert to Mel Spectrogram
+        if self.mode in ['spectrogram', 'spectrum_1d']:
+            # Convert to Mel Spectrogram (both modes use 2D spectrograms, differ in model patchification)
             # Target: 64x64
             # 16000 samples. 
             # To get 64 time steps: hop_length = 16000 / 64 = 250.
