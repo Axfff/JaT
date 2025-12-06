@@ -48,7 +48,7 @@ class MultiScaleSpectralLoss(nn.Module):
         weight: Weight for the spectral loss term (default: 0.1)
         use_log: If True, compute loss on log-magnitude (reduces penalty on loud signals)
     """
-    def __init__(self, fft_sizes=[512, 1024, 2048], hop_ratio=0.25, weight=0.1, use_log=False):
+    def __init__(self, fft_sizes=[64, 128, 256, 512, 1024, 2048], hop_ratio=0.25, weight=0.1, use_log=False):
         super().__init__()
         self.fft_sizes = fft_sizes
         self.hop_ratio = hop_ratio
@@ -334,7 +334,7 @@ def train(args):
     spectral_loss_fn = None
     if args.use_spectral_loss and args.dataset_mode == 'raw':
         spectral_loss_fn = MultiScaleSpectralLoss(
-            fft_sizes=[512, 1024, 2048],
+            fft_sizes=[64, 128, 256, 512, 1024, 2048],
             weight=args.spectral_loss_weight,
             use_log=args.spectral_log_scale
         ).to(device)
