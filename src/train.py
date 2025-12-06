@@ -14,81 +14,6 @@ from dataset import get_dataloader
 from model import JiT, JiT_models
 
 
-# --- Debug utilities for diagnosing NaN issues ---
-def check_for_nan(tensor, name, batch_idx=None, extra_info=None):
-    """Check for NaN/Inf in tensor and print detailed debug info if found."""
-    if tensor is None:
-        return False
-    
-    has_nan = torch.isnan(tensor).any().item()
-    has_inf = torch.isinf(tensor).any().item()
-    
-    if has_nan or has_inf:
-        batch_str = f" [batch {batch_idx}]" if batch_idx is not None else ""
-        print(f"\n{'='*60}")
-        print(f"⚠️ NaN/Inf DETECTED in {name}{batch_str}")
-        print(f"{'='*60}")
-        print(f"  Shape: {tensor.shape}")
-        print(f"  dtype: {tensor.dtype}")
-        print(f"  has_nan: {has_nan}, has_inf: {has_inf}")
-        print(f"  min: {tensor.min().item() if not has_nan else 'NaN'}")
-        print(f"  max: {tensor.max().item() if not has_nan else 'NaN'}")
-        print(f"  mean: {tensor.float().mean().item() if not has_nan else 'NaN'}")
-        
-        if has_nan:
-            nan_count = torch.isnan(tensor).sum().item()
-            total = tensor.numel()
-            print(f"  NaN count: {nan_count}/{total} ({100*nan_count/total:.2f}%)")
-        
-        if has_inf:
-            inf_count = torch.isinf(tensor).sum().item()
-            total = tensor.numel()
-            print(f"  Inf count: {inf_count}/{total} ({100*inf_count/total:.2f}%)")
-        
-        if extra_info:
-            print(f"  Extra info: {extra_info}")
-        print(f"{'='*60}\n")
-        return True
-    return False
-
-
-def print_training_state_debug(batch_idx, x, z_t, noise, t, x_pred, v_pred, v_target, loss_time, loss_spec, spectral_loss_fn):
-    """Print comprehensive debug info for diagnosing NaN issues."""
-    print(f"\n{'='*70}")
-    print(f"TRAINING STATE DEBUG - Batch {batch_idx}")
-    print(f"{'='*70}")
-    
-    # Input stats
-    print(f"\n--- Input Data ---")
-    print(f"  x (clean audio): min={x.min().item():.4f}, max={x.max().item():.4f}, mean={x.float().mean().item():.4f}")
-    print(f"  z_t (noisy): min={z_t.min().item():.4f}, max={z_t.max().item():.4f}, mean={z_t.float().mean().item():.4f}")
-    print(f"  noise: min={noise.min().item():.4f}, max={noise.max().item():.4f}, mean={noise.float().mean().item():.4f}")
-    print(f"  t: min={t.min().item():.4f}, max={t.max().item():.4f}, mean={t.mean().item():.4f}")
-    
-    # Model output stats  
-    print(f"\n--- Model Output ---")
-    print(f"  x_pred: min={x_pred.min().item():.4f}, max={x_pred.max().item():.4f}, mean={x_pred.float().mean().item():.4f}")
-    
-    # Velocity stats
-    print(f"\n--- Velocity ---")
-    print(f"  v_pred: min={v_pred.min().item():.4f}, max={v_pred.max().item():.4f}, mean={v_pred.float().mean().item():.4f}")
-    print(f"  v_target: min={v_target.min().item():.4f}, max={v_target.max().item():.4f}, mean={v_target.float().mean().item():.4f}")
-    
-    # Loss stats
-    print(f"\n--- Losses ---")
-    print(f"  loss_time (v-MSE): {loss_time.item():.6f}")
-    print(f"  loss_spec: {loss_spec.item() if isinstance(loss_spec, torch.Tensor) else loss_spec:.6f}")
-    
-    if spectral_loss_fn is not None:
-        print(f"\n--- Spectral Loss Config ---")
-        print(f"  FFT sizes: {spectral_loss_fn.fft_sizes}")
-        print(f"  use_log: {spectral_loss_fn.use_log}")
-        print(f"  weight: {spectral_loss_fn.weight}")
-        print(f"  eps_map: {spectral_loss_fn.eps_map}")
-    
-    print(f"{'='*70}\n")
-
-
 # --- Cosine Schedule for t sampling ---
 def cosine_schedule(t, s=0.008):
     """
@@ -123,13 +48,12 @@ class MultiScaleSpectralLoss(nn.Module):
         weight: Weight for the spectral loss term (default: 0.1)
         use_log: If True, compute loss on log-magnitude (reduces penalty on loud signals)
     """
-    def __init__(self, fft_sizes=[64, 128, 256, 512, 1024, 2048], hop_ratio=0.25, weight=0.1, use_log=False, debug=False):
+    def __init__(self, fft_sizes=[64, 128, 256, 512, 1024, 2048], hop_ratio=0.25, weight=0.1, use_log=False):
         super().__init__()
         self.fft_sizes = fft_sizes
         self.hop_ratio = hop_ratio
         self.weight = weight
         self.use_log = use_log
-        self.debug = debug
         
         # Adaptive epsilon: smaller FFT sizes need larger eps to prevent gradient explosion
         # This is because smaller FFTs have less energy per bin (more spread out)
@@ -172,16 +96,7 @@ class MultiScaleSpectralLoss(nn.Module):
         pred_wave = pred_wave.float()
         target_wave = target_wave.float()
         
-        # Debug: Check input waveforms
-        if self.debug:
-            if check_for_nan(pred_wave, "spectral_loss input pred_wave"):
-                print(f"  pred_wave stats: min={pred_wave.min():.4f}, max={pred_wave.max():.4f}")
-            if check_for_nan(target_wave, "spectral_loss input target_wave"):
-                print(f"  target_wave stats: min={target_wave.min():.4f}, max={target_wave.max():.4f}")
-        
         loss = 0.0
-        per_fft_losses = {}  # Track loss per FFT size for debugging
-        
         for fft_size in self.fft_sizes:
             hop_length = int(fft_size * self.hop_ratio)
             window = getattr(self, f'window_{fft_size}')
@@ -204,12 +119,6 @@ class MultiScaleSpectralLoss(nn.Module):
                 return_complex=True
             ).abs()
             
-            # Debug: Check STFT output
-            if self.debug and (check_for_nan(pred_spec, f"pred_spec[fft={fft_size}]") or 
-                               check_for_nan(target_spec, f"target_spec[fft={fft_size}]")):
-                print(f"  FFT size {fft_size}: pred_spec min={pred_spec.min():.6f}, max={pred_spec.max():.6f}")
-                print(f"  FFT size {fft_size}: target_spec min={target_spec.min():.6f}, max={target_spec.max():.6f}")
-            
             # Normalize by sqrt(fft_size) to make magnitudes comparable across scales
             # This compensates for the fact that smaller FFTs distribute energy differently
             norm_factor = math.sqrt(fft_size / 2048.0)  # Normalize relative to largest FFT
@@ -226,41 +135,15 @@ class MultiScaleSpectralLoss(nn.Module):
                 pred_spec = torch.log(torch.clamp(pred_spec, min=eps))
                 target_spec = torch.log(torch.clamp(target_spec, min=eps))
                 
-                # Debug: Check after log transform
-                if self.debug and (check_for_nan(pred_spec, f"pred_spec_log[fft={fft_size}]") or 
-                                   check_for_nan(target_spec, f"target_spec_log[fft={fft_size}]")):
-                    print(f"  After log - pred_spec: min={pred_spec.min():.6f}, max={pred_spec.max():.6f}")
-                    print(f"  After log - target_spec: min={target_spec.min():.6f}, max={target_spec.max():.6f}")
-                
                 # Clamp log output to prevent extreme values that could overflow
                 pred_spec = torch.clamp(pred_spec, min=-10.0, max=10.0)
                 target_spec = torch.clamp(target_spec, min=-10.0, max=10.0)
             
             # L1 loss on magnitude (ignores phase misalignment)
-            fft_loss = F.l1_loss(pred_spec, target_spec)
-            per_fft_losses[fft_size] = fft_loss.item()
-            
-            # Debug: Check per-FFT loss
-            if self.debug and not torch.isfinite(fft_loss):
-                print(f"\n⚠️ NaN/Inf loss at FFT size {fft_size}!")
-                print(f"  fft_loss = {fft_loss.item()}")
-                print(f"  pred_spec: min={pred_spec.min():.6f}, max={pred_spec.max():.6f}, has_nan={torch.isnan(pred_spec).any()}")
-                print(f"  target_spec: min={target_spec.min():.6f}, max={target_spec.max():.6f}, has_nan={torch.isnan(target_spec).any()}")
-            
-            loss += fft_loss
+            loss += F.l1_loss(pred_spec, target_spec)
         
         # Average over number of scales and apply weight
-        final_loss = self.weight * (loss / len(self.fft_sizes))
-        
-        # Debug: Print per-FFT breakdown if final loss is bad
-        if self.debug and not torch.isfinite(final_loss):
-            print(f"\n⚠️ Spectral loss breakdown (weight={self.weight}):")
-            for fft_size, fft_loss in per_fft_losses.items():
-                print(f"  FFT {fft_size}: {fft_loss:.6f}")
-            print(f"  Total (before weight): {loss:.6f}")
-            print(f"  Final (after weight): {final_loss.item()}")
-        
-        return final_loss
+        return self.weight * (loss / len(self.fft_sizes))
 
 
 # --- Noise Scheduler ---
@@ -472,12 +355,10 @@ def train(args):
         spectral_loss_fn = MultiScaleSpectralLoss(
             fft_sizes=[64, 128, 256, 512, 1024, 2048],
             weight=args.spectral_loss_weight,
-            use_log=args.spectral_log_scale,
-            debug=args.debug_nan
+            use_log=args.spectral_log_scale
         ).to(device)
-        debug_msg = " [DEBUG MODE ON]" if args.debug_nan else ""
         log_msg = "log-scale" if args.spectral_log_scale else "linear-scale"
-        print(f"Using Multi-Scale Spectral Loss ({log_msg}) with weight={args.spectral_loss_weight}{debug_msg}")
+        print(f"Using Multi-Scale Spectral Loss ({log_msg}) with weight={args.spectral_loss_weight}")
     
     model.train()
     
@@ -613,37 +494,7 @@ def train(args):
             
             # Check for NaN/Inf in loss and skip batch if found
             if not torch.isfinite(loss):
-                print(f"\n{'='*70}")
-                print(f"⚠️ NON-FINITE LOSS DETECTED at batch {i}, epoch {epoch}")
-                print(f"{'='*70}")
-                print(f"loss_time: {loss_time.item() if isinstance(loss_time, torch.Tensor) else loss_time}")
-                print(f"loss_spec: {loss_spec.item() if isinstance(loss_spec, torch.Tensor) else loss_spec}")
-                print(f"loss_total: {loss.item()}")
-                
-                # Detailed debug info
-                if args.loss_type == 'x_v_loss':
-                    try:
-                        print_training_state_debug(
-                            i, x, z_t, noise, t, x_pred, v_pred, v_target, 
-                            loss_time, loss_spec, spectral_loss_fn
-                        )
-                    except Exception as e:
-                        print(f"Could not print debug state: {e}")
-                
-                # Check each component for NaN
-                check_for_nan(x, "x (input data)", i)
-                check_for_nan(z_t, "z_t (noisy input)", i)
-                check_for_nan(noise, "noise", i)
-                check_for_nan(model_output, "model_output", i)
-                if args.loss_type == 'x_v_loss':
-                    check_for_nan(x_pred, "x_pred", i)
-                    check_for_nan(v_pred, "v_pred", i)
-                    check_for_nan(v_target, "v_target", i)
-                    check_for_nan(loss_time, "loss_time", i)
-                    check_for_nan(loss_spec, "loss_spec", i)
-                
-                print(f"{'='*70}\n")
-                print(f"Skipping batch due to non-finite loss")
+                print(f"WARNING: Non-finite loss detected ({loss.item()}), skipping batch")
                 # Don't call scaler.update() here - no gradient ops were done
                 continue
             
@@ -786,7 +637,8 @@ if __name__ == "__main__":
     parser.add_argument('--P_std', type=float, default=0.8, help='Logit-normal std for time sampling')
     parser.add_argument('--noise_scale', type=float, default=1.0, help='Noise scale factor')
     parser.add_argument('--t_eps', type=float, default=5e-2, help='Minimum t value to avoid division by zero')
-    parser.add_argument('--fp16', action='store_true', default=True, help='Enable mixed precision training')
+    parser.add_argument('--no-fp16', dest='fp16', action='store_false', help='Disable mixed precision training (use full FP32)')
+    parser.set_defaults(fp16=True)
     
     # Schedule type
     parser.add_argument('--schedule_type', type=str, default='linear', choices=['linear', 'cosine'],
@@ -805,10 +657,6 @@ if __name__ == "__main__":
                         help='Weight for spectral loss term (default: 0.1)')
     parser.add_argument('--spectral_log_scale', action='store_true', default=False,
                         help='Use log-scale spectral loss (balances training across frequencies)')
-    
-    # Debugging
-    parser.add_argument('--debug_nan', action='store_true', default=False,
-                        help='Enable detailed NaN/Inf debugging output (prints diagnostics when NaN loss occurs)')
     
     args = parser.parse_args()
     train(args)
