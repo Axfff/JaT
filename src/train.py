@@ -479,8 +479,8 @@ def train(args):
             epoch_loss_total += loss_total_val
             steps += 1
             
-            # Log step loss (every 100 steps to reduce I/O)
-            if i % 100 == 0:
+            # Log step loss (every 10 steps to reduce I/O)
+            if i % 10 == 0:
                 with open(log_file, 'a') as f:
                     f.write(f'{epoch},train,{i},{loss_time_val:.6f},{loss_spec_val:.6f},{loss_total_val:.6f}\n')
         
