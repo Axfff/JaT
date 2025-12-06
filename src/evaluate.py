@@ -107,11 +107,11 @@ def save_audio(batch, dataset_mode, output_dir, sample_rate=16000, device='cuda'
     os.makedirs(output_dir, exist_ok=True)
     
     vocoder = None
-    if dataset_mode == 'spectrogram':
+    if dataset_mode in ['spectrogram', 'spectrum_1d']:
         vocoder = load_vocoder(device=device)
 
     for i, item in enumerate(batch):
-        if dataset_mode == 'spectrogram':
+        if dataset_mode in ['spectrogram', 'spectrum_1d']:
             # item: [1, 64, 64] (or similar)
             # We need to ensure it's on the correct device for the vocoder
             spec = item.to(device)

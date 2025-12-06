@@ -75,9 +75,20 @@ def load_model_predictions(checkpoint_path, dataset_mode, pred_mode, num_samples
     if dataset_mode == 'raw':
         input_size = 16384
         in_channels = 1
-    else:
+        is_1d = True
+        is_spectrum = False
+    elif dataset_mode == 'spectrum_1d':
         input_size = 64
         in_channels = 1
+        is_1d = False
+        is_spectrum = True
+    elif dataset_mode == 'spectrogram':
+        input_size = 64
+        in_channels = 1
+        is_1d = False
+        is_spectrum = False
+    else:
+        raise ValueError(f"Invalid dataset mode: {dataset_mode}")
         
     model = JiT(
         input_size=input_size,
@@ -89,7 +100,10 @@ def load_model_predictions(checkpoint_path, dataset_mode, pred_mode, num_samples
         num_classes=35,
         bottleneck_dim=512, # Default matching hidden_size
         in_context_len=0,   # Default 0
-        is_1d=(dataset_mode == 'raw')
+        is_1d=is_1d,
+        is_spectrum=is_spectrum,
+        freq_bins=64,
+        time_frames=64
     ).to(device)
     
     state_dict = torch.load(checkpoint_path, map_location=device)
@@ -164,8 +178,12 @@ def visualize_comparison(predictions, groundtruth, save_path, pred_is_waveform=T
             # predictions are waveforms, convert to spectrogram
             pred_spec = waveform_to_spectrogram(predictions[i].cpu())
         else:
-            # predictions are already spectrograms (1, 4096) -> (64, 64)
-            pred_spec = predictions[i].cpu().view(64, 64)
+            # predictions are already spectrograms [1, 64, 64] or [64, 64]
+            pred_tensor = predictions[i].cpu()
+            if pred_tensor.dim() == 3:
+                pred_spec = pred_tensor.squeeze(0)  # [1, 64, 64] -> [64, 64]
+            else:
+                pred_spec = pred_tensor.view(64, 64)
         pred_specs.append(pred_spec)
         
         # Process groundtruth
@@ -262,7 +280,11 @@ def compute_metrics(predictions, groundtruth, pred_is_waveform=True, gt_is_wavef
         if pred_is_waveform:
             pred_spec = waveform_to_spectrogram(predictions[i].cpu())
         else:
-            pred_spec = predictions[i].cpu().view(64, 64)
+            pred_tensor = predictions[i].cpu()
+            if pred_tensor.dim() == 3:
+                pred_spec = pred_tensor.squeeze(0)
+            else:
+                pred_spec = pred_tensor.view(64, 64)
             
         if gt_is_waveform:
             gt_spec = waveform_to_spectrogram(groundtruth[i])
@@ -315,8 +337,8 @@ def main():
     parser.add_argument('--data_root', type=str, default='./data',
                         help='Root directory for dataset')
     parser.add_argument('--dataset_mode', type=str, default='raw', 
-                        choices=['raw', 'spectrogram'],
-                        help='Dataset mode: raw waveform or spectrogram')
+                        choices=['raw', 'spectrogram', 'spectrum_1d'],
+                        help='Dataset mode: raw waveform, spectrogram, or spectrum_1d')
     parser.add_argument('--pred_mode', type=str, default='x', 
                         choices=['epsilon', 'x', 'v'],
                         help='Prediction mode for the model')
