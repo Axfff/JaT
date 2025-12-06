@@ -54,9 +54,15 @@ class MultiScaleSpectralLoss(nn.Module):
         self.hop_ratio = hop_ratio
         self.weight = weight
         self.use_log = use_log
-        # INCREASED: 1e-7 -> 1e-5 for FP16 stability
-        # 1e-7 causes underflow in FP16 and gradient explosion (1/eps = 10M)
-        self.eps = 1e-5
+        # INCREASED: 1e-5 -> 1e-4 for FP16 stability
+        # This limits max gradient to 10,000 (vs 100,000 for 1e-5)
+        # Critical for preventing gradient explosion with log-scale loss
+        self.eps = 1e-4
+        
+        # Pre-register windows as buffers to avoid recreation every forward pass
+        # This also ensures they move to the correct device with the module
+        for fft_size in fft_sizes:
+            self.register_buffer(f'window_{fft_size}', torch.hann_window(fft_size))
         
     def forward(self, pred_wave, target_wave):
         """
@@ -74,16 +80,23 @@ class MultiScaleSpectralLoss(nn.Module):
             pred_wave = pred_wave.squeeze(1)
             target_wave = target_wave.squeeze(1)
         
+        # CRITICAL: Force float32 for STFT computation
+        # STFT is numerically unstable in FP16 and can produce NaN/Inf
+        original_dtype = pred_wave.dtype
+        pred_wave = pred_wave.float()
+        target_wave = target_wave.float()
+        
         loss = 0.0
         for fft_size in self.fft_sizes:
             hop_length = int(fft_size * self.hop_ratio)
+            window = getattr(self, f'window_{fft_size}')
             
-            # Compute STFT magnitude
+            # Compute STFT magnitude (in float32)
             pred_spec = torch.stft(
                 pred_wave, 
                 n_fft=fft_size, 
                 hop_length=hop_length,
-                window=torch.hann_window(fft_size, device=pred_wave.device),
+                window=window,
                 return_complex=True
             ).abs()
             
@@ -91,7 +104,7 @@ class MultiScaleSpectralLoss(nn.Module):
                 target_wave, 
                 n_fft=fft_size, 
                 hop_length=hop_length,
-                window=torch.hann_window(fft_size, device=target_wave.device),
+                window=window,
                 return_complex=True
             ).abs()
             
@@ -99,11 +112,16 @@ class MultiScaleSpectralLoss(nn.Module):
                 # Log-scale spectral loss: reduces penalty on loud signals,
                 # balances training across frequencies
                 # 
-                # FIX: Use clamp BEFORE log instead of log(x + eps)
-                # This guarantees gradient <= 1/eps, preventing explosion
-                # log(x + eps) can still have massive gradients when x is negative
+                # FP16 SAFETY: 
+                # 1. Clamp input to eps before log (limits gradient to 1/eps = 10,000)
+                # 2. Clamp output to reasonable range to prevent extreme values
                 pred_spec = torch.log(torch.clamp(pred_spec, min=self.eps))
                 target_spec = torch.log(torch.clamp(target_spec, min=self.eps))
+                
+                # Clamp log output to prevent extreme values that could overflow
+                # log(1e-4) ≈ -9.2, log(1e3) ≈ 6.9, so [-15, 10] is safe range
+                pred_spec = torch.clamp(pred_spec, min=-15.0, max=10.0)
+                target_spec = torch.clamp(target_spec, min=-15.0, max=10.0)
             
             # L1 loss on magnitude (ignores phase misalignment)
             loss += F.l1_loss(pred_spec, target_spec)
