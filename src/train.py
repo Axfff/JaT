@@ -331,7 +331,8 @@ def train(args):
         is_spectrum=is_spectrum,
         freq_bins=freq_bins if freq_bins else args.freq_bins,
         time_frames=time_frames if time_frames else args.time_frames,
-        use_snake=args.use_snake  # Snake activation for audio periodicity
+        use_snake=args.use_snake,  # Snake activation for audio periodicity
+        hop_size=args.hop_size if args.dataset_mode == 'raw' else None  # Overlap for raw audio only
     ).to(device)
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
@@ -618,6 +619,8 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_mode', type=str, default='raw', choices=['raw', 'spectrogram', 'spectrum_1d'])
     parser.add_argument('--loss_type', type=str, default='x', choices=['epsilon_epsilon_loss', 'v_v_loss', 'x_v_loss'])
     parser.add_argument('--patch_size', type=int, default=512)
+    parser.add_argument('--hop_size', type=int, default=None,
+                        help='Hop size for overlapping patches (raw mode only). Default: same as patch_size (no overlap)')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)

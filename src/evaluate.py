@@ -192,6 +192,8 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_mode', type=str, default='raw', choices=['raw', 'spectrogram', 'spectrum_1d'])
     parser.add_argument('--pred_mode', type=str, default='x', choices=['epsilon', 'x', 'v', 'epsilon_epsilon_loss', 'v_v_loss', 'x_v_loss'])
     parser.add_argument('--patch_size', type=int, default=512)
+    parser.add_argument('--hop_size', type=int, default=None,
+                        help='Hop size for overlapping patches (raw mode only). Must match training config.')
     parser.add_argument('--noise_scale', type=float, default=1.0, help='Noise scale factor')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--hidden_size', type=int, default=512, help='Model hidden size')
@@ -251,7 +253,8 @@ if __name__ == "__main__":
         is_spectrum=is_spectrum,
         freq_bins=args.freq_bins,
         time_frames=args.time_frames,
-        use_snake=args.use_snake
+        use_snake=args.use_snake,
+        hop_size=args.hop_size if args.dataset_mode == 'raw' else None  # Overlap for raw audio only
     ).to(args.device)
     
     state_dict = torch.load(args.checkpoint, map_location=args.device)

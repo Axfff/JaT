@@ -51,6 +51,68 @@ class BottleneckPatchEmbed(nn.Module):
         return x
 
 
+class OverlappingPatchEmbed1D(nn.Module):
+    """
+    1D Patch Embedding with configurable overlap (hop_size).
+    
+    For raw audio of shape [B, C, L]:
+    - Extracts overlapping windows of size `patch_size` with stride `hop_size`
+    - When hop_size < patch_size, windows overlap
+    - Number of patches = (L - patch_size) // hop_size + 1
+    
+    Args:
+        input_size: Total input length (e.g., 16384 for 1s at 16kHz)
+        patch_size: Size of each patch/window
+        hop_size: Stride between patches (hop_size < patch_size = overlap)
+        in_chans: Input channels (1 for mono audio)
+        pca_dim: Bottleneck dimension
+        embed_dim: Output embedding dimension
+    """
+    def __init__(self, input_size=16384, patch_size=512, hop_size=256, 
+                 in_chans=1, pca_dim=768, embed_dim=768, bias=True):
+        super().__init__()
+        self.input_size = input_size
+        self.patch_size = patch_size
+        self.hop_size = hop_size
+        self.in_chans = in_chans
+        
+        # Calculate number of patches
+        self.num_patches = (input_size - patch_size) // hop_size + 1
+        
+        # Two-stage projection (bottleneck architecture like BottleneckPatchEmbed)
+        # Input per patch: [in_chans * patch_size]
+        patch_dim = in_chans * patch_size
+        self.proj1 = nn.Linear(patch_dim, pca_dim, bias=False)
+        self.proj2 = nn.Linear(pca_dim, embed_dim, bias=bias)
+        
+        # Register Hann window as buffer for overlap-add reconstruction
+        # This will be used by unpatchify
+        hann = torch.hann_window(patch_size)
+        self.register_buffer('hann_window', hann)
+        
+    def forward(self, x):
+        """
+        x: [B, C, L] - raw audio
+        Returns: [B, num_patches, embed_dim]
+        """
+        B, C, L = x.shape
+        assert L == self.input_size, f"Input size {L} doesn't match model {self.input_size}."
+        
+        # Extract overlapping patches using unfold
+        # unfold(dimension, size, step) -> [B, C, num_patches, patch_size]
+        patches = x.unfold(2, self.patch_size, self.hop_size)  # [B, C, num_patches, patch_size]
+        
+        # Reshape to [B, num_patches, C * patch_size]
+        patches = patches.permute(0, 2, 1, 3)  # [B, num_patches, C, patch_size]
+        patches = patches.reshape(B, self.num_patches, C * self.patch_size)
+        
+        # Apply projections
+        x = self.proj2(self.proj1(patches))  # [B, num_patches, embed_dim]
+        
+        return x
+
+
+
 class SpectrumPatchEmbed(nn.Module):
     """
     Spectrogram to Patch Embedding - patches ONLY along time axis.
@@ -395,6 +457,8 @@ class JiT(nn.Module):
     
     Args:
         use_snake: If True, use Snake activation in FFN blocks for better audio periodicity
+        hop_size: For 1D mode, stride between patches. If hop_size < patch_size, patches overlap.
+                 Use None or 0 for non-overlapping (defaults to patch_size).
     """
     def __init__(
         self,
@@ -415,7 +479,8 @@ class JiT(nn.Module):
         is_spectrum=False,
         freq_bins=64,  # For spectrum mode: number of frequency bins
         time_frames=64,  # For spectrum mode: number of time frames
-        use_snake=False  # Use Snake activation for audio waveform generation
+        use_snake=False,  # Use Snake activation for audio waveform generation
+        hop_size=None  # For 1D mode: stride between patches (None = patch_size = no overlap)
     ):
         super().__init__()
         self.is_1d = is_1d
@@ -432,6 +497,10 @@ class JiT(nn.Module):
         self.in_context_start = in_context_start
         self.num_classes = num_classes
         self.use_snake = use_snake
+        
+        # For 1D overlapping mode
+        self.hop_size = hop_size if hop_size is not None and hop_size > 0 else patch_size
+        self.use_overlap = is_1d and (self.hop_size < patch_size)
 
         # time and class embed
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -446,6 +515,17 @@ class JiT(nn.Module):
                 in_chans=in_channels, 
                 pca_dim=bottleneck_dim, 
                 embed_dim=hidden_size, 
+                bias=True
+            )
+        elif is_1d and self.use_overlap:
+            # 1D with overlapping patches
+            self.x_embedder = OverlappingPatchEmbed1D(
+                input_size=input_size,
+                patch_size=patch_size,
+                hop_size=self.hop_size,
+                in_chans=in_channels,
+                pca_dim=bottleneck_dim,
+                embed_dim=hidden_size,
                 bias=True
             )
         else:
@@ -576,13 +656,16 @@ class JiT(nn.Module):
             
             return x
         elif self.is_1d:
-            # x: [N, T, p*c]
-            # output: [N, c, L]
-            # reshape to [N, T, p, c] -> [N, c, T, p] -> [N, c, L]
-            x = x.reshape(shape=(x.shape[0], x.shape[1], p, c))
-            x = torch.einsum('ntpc->nctp', x)
-            imgs = x.reshape(shape=(x.shape[0], c, x.shape[2] * p))
-            return imgs
+            if self.use_overlap:
+                # Overlapping patches: use Hann window overlap-add reconstruction
+                return self._unpatchify_overlap(x, p)
+            else:
+                # Non-overlapping: simple reshape
+                # x: [N, T, p*c] -> [N, c, L]
+                x = x.reshape(shape=(x.shape[0], x.shape[1], p, c))
+                x = torch.einsum('ntpc->nctp', x)
+                imgs = x.reshape(shape=(x.shape[0], c, x.shape[2] * p))
+                return imgs
         else:
             h = w = int(x.shape[1] ** 0.5)
             assert h * w == x.shape[1]
@@ -591,6 +674,53 @@ class JiT(nn.Module):
             x = torch.einsum('nhwpqc->nchpwq', x)
             imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
             return imgs
+
+    def _unpatchify_overlap(self, x, p):
+        """
+        Overlap-add reconstruction with Hann windowing for smooth crossfade.
+        
+        Args:
+            x: [N, num_patches, p * c] patch sequence
+            p: patch_size
+            
+        Returns:
+            [N, c, L] reconstructed signal
+        """
+        N, num_patches, _ = x.shape
+        c = self.out_channels
+        hop = self.hop_size
+        L = self.input_size  # Original input length
+        
+        # Reshape to [N, num_patches, p, c]
+        x = x.reshape(N, num_patches, p, c)
+        
+        # Permute to [N, c, num_patches, p]
+        x = x.permute(0, 3, 1, 2)  # [N, c, num_patches, p]
+        
+        # Get Hann window from embedder
+        hann = self.x_embedder.hann_window  # [p]
+        
+        # Prepare output and normalization buffers
+        output = torch.zeros(N, c, L, device=x.device, dtype=x.dtype)
+        norm = torch.zeros(L, device=x.device, dtype=x.dtype)
+        
+        # Overlap-add with Hann windowing
+        for i in range(num_patches):
+            start = i * hop
+            end = start + p
+            
+            # Apply Hann window to each patch
+            windowed = x[:, :, i, :] * hann  # [N, c, p] * [p] -> [N, c, p]
+            
+            output[:, :, start:end] += windowed
+            norm[start:end] += hann
+        
+        # Normalize by window overlap
+        # Avoid division by zero
+        norm = torch.clamp(norm, min=1e-8)
+        output = output / norm.unsqueeze(0).unsqueeze(0)  # [N, c, L] / [1, 1, L]
+        
+        return output
 
     def forward(self, x, t, y, drop_labels=None):
         """
