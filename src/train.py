@@ -14,6 +14,47 @@ from dataset import get_dataloader
 from model import JiT, JiT_models
 
 
+# --- Exponential Moving Average ---
+class EMA:
+    """
+    Exponential Moving Average for model parameters.
+    
+    Maintains a shadow copy of model parameters that is updated with a decay
+    factor after each optimizer step. EMA weights typically produce smoother
+    and more stable results for inference.
+    
+    Args:
+        model: The model to track
+        decay: EMA decay rate (default: 0.9999, higher = slower update)
+    """
+    def __init__(self, model, decay=0.9999):
+        self.decay = decay
+        # Clone parameters and detach from computation graph
+        self.params = [p.clone().detach() for p in model.parameters()]
+        for p in self.params:
+            p.requires_grad = False
+    
+    @torch.no_grad()
+    def update(self, model):
+        """Update EMA parameters with current model parameters."""
+        for ema_p, model_p in zip(self.params, model.parameters()):
+            ema_p.mul_(self.decay).add_(model_p, alpha=1 - self.decay)
+    
+    def state_dict(self):
+        """Return state dict for checkpointing."""
+        return {'params': self.params, 'decay': self.decay}
+    
+    def load_state_dict(self, state_dict):
+        """Load state from checkpoint."""
+        self.params = state_dict['params']
+        self.decay = state_dict['decay']
+    
+    def apply_to(self, model):
+        """Copy EMA parameters to model (for inference)."""
+        for ema_p, model_p in zip(self.params, model.parameters()):
+            model_p.data.copy_(ema_p)
+
+
 # --- Cosine Schedule for t sampling ---
 def cosine_schedule(t, s=0.008):
     """
@@ -361,16 +402,28 @@ def train(args):
         log_msg = "log-scale" if args.spectral_log_scale else "linear-scale"
         print(f"Using Multi-Scale Spectral Loss ({log_msg}) with weight={args.spectral_loss_weight}")
     
+    # EMA (Exponential Moving Average)
+    ema = None
+    if args.ema_decay > 0:
+        ema = EMA(model, decay=args.ema_decay)
+        print(f"Using EMA with decay={args.ema_decay}")
+    
     model.train()
     
     start_epoch = 0
     if args.resume_checkpoint:
         print(f"Resuming from checkpoint: {args.resume_checkpoint}")
-        state_dict = torch.load(args.resume_checkpoint, map_location=device)
-        model.load_state_dict(state_dict)
-        # Assuming checkpoint filename format: model_{name}_ep{epoch}.pth
-        # We can parse epoch from filename or just pass it.
-        # Let's try to parse.
+        checkpoint = torch.load(args.resume_checkpoint, map_location=device)
+        # Support both new format (dict with 'model' and 'ema') and legacy format (just state_dict)
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            model.load_state_dict(checkpoint['model'])
+            if 'ema' in checkpoint and ema is not None:
+                ema.load_state_dict(checkpoint['ema'])
+                print("Restored EMA state from checkpoint")
+        else:
+            # Legacy format: checkpoint is just state_dict
+            model.load_state_dict(checkpoint)
+        # Parse epoch from filename
         try:
             start_epoch = int(args.resume_checkpoint.split('_ep')[-1].split('.pth')[0])
             print(f"Resumed from epoch {start_epoch}")
@@ -516,6 +569,10 @@ def train(args):
             scaler.step(optimizer)
             scaler.update()
             
+            # Update EMA
+            if ema is not None:
+                ema.update(model)
+            
             # Track separate losses
             loss_time_val = loss_time.item() if isinstance(loss_time, torch.Tensor) else loss_time
             loss_spec_val = loss_spec.item() if isinstance(loss_spec, torch.Tensor) else loss_spec
@@ -609,9 +666,12 @@ def train(args):
                     f.write(f'{epoch},val,-1,{avg_val_time:.6f},{avg_val_spec:.6f},{avg_val_total:.6f}\n')
                 print(f"Epoch {epoch+1} Val   - Total: {avg_val_total:.4f}, Time: {avg_val_time:.4f}, Spec: {avg_val_spec:.4f}")
             
-        # Save checkpoint
+        # Save checkpoint (new format with EMA support)
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            torch.save(model.state_dict(), f'checkpoints/model_{args.experiment_name}_ep{epoch+1}.pth')
+            checkpoint = {'model': model.state_dict()}
+            if ema is not None:
+                checkpoint['ema'] = ema.state_dict()
+            torch.save(checkpoint, f'checkpoints/model_{args.experiment_name}_ep{epoch+1}.pth')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -664,6 +724,10 @@ if __name__ == "__main__":
                         help='Weight for spectral loss term (default: 0.1)')
     parser.add_argument('--spectral_log_scale', action='store_true', default=False,
                         help='Use log-scale spectral loss (balances training across frequencies)')
+    
+    # EMA (Exponential Moving Average)
+    parser.add_argument('--ema_decay', type=float, default=0.9999,
+                        help='EMA decay rate (0 to disable, default: 0.9999)')
     
     args = parser.parse_args()
     train(args)

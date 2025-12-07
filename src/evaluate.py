@@ -216,6 +216,10 @@ if __name__ == "__main__":
                         help='Disable mixed precision inference (use full FP32, must match training)')
     parser.set_defaults(fp16=True)
     
+    # EMA
+    parser.add_argument('--use_ema', action='store_true', default=False,
+                        help='Use EMA weights from checkpoint (if available)')
+    
     args = parser.parse_args()
     
     # Load Model - determine configuration based on dataset_mode
@@ -257,8 +261,24 @@ if __name__ == "__main__":
         hop_size=args.hop_size if args.dataset_mode == 'raw' else None  # Overlap for raw audio only
     ).to(args.device)
     
-    state_dict = torch.load(args.checkpoint, map_location=args.device)
-    model.load_state_dict(state_dict)
+    # Load checkpoint - support both new format (dict) and legacy format (state_dict)
+    checkpoint = torch.load(args.checkpoint, map_location=args.device)
+    if isinstance(checkpoint, dict) and 'model' in checkpoint:
+        if args.use_ema and 'ema' in checkpoint:
+            print("Loading EMA weights for inference...")
+            # Apply EMA params directly to model
+            ema_params = checkpoint['ema']['params']
+            for p, ema_p in zip(model.parameters(), ema_params):
+                p.data.copy_(ema_p.to(args.device))
+        else:
+            model.load_state_dict(checkpoint['model'])
+            if args.use_ema:
+                print("Warning: --use_ema specified but checkpoint has no EMA state")
+    else:
+        # Legacy format: checkpoint is just state_dict
+        model.load_state_dict(checkpoint)
+        if args.use_ema:
+            print("Warning: --use_ema specified but checkpoint is legacy format (no EMA)")
     
     if args.cfg_scale > 1.0:
         print(f"Generating samples with CFG scale={args.cfg_scale}...")
