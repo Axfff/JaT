@@ -38,7 +38,7 @@ def load_vocoder(device='cuda'):
 
 
 
-def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0):
+def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0, use_fp16=True):
     """
     Generate samples using Flow Matching with optional Classifier-Free Guidance.
     
@@ -51,6 +51,7 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
         pred_mode: Prediction mode ('epsilon', 'x', 'v', etc.)
         noise_scale: Scale for initial noise
         cfg_scale: CFG guidance scale (1.0 = no guidance, >1.0 = stronger guidance)
+        use_fp16: Whether to use FP16 mixed precision (default: True)
     """
     model.eval()
     
@@ -74,7 +75,7 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
             t_batch = torch.ones(num_samples, device=device) * t
             
             # Model input t in [0, 1] (raw, not scaled)
-            with autocast(enabled=(device!='cpu')):
+            with autocast(enabled=(use_fp16 and device!='cpu')):
                 if cfg_scale > 1.0:
                     # CFG: Run model twice (conditional and unconditional)
                     model_out = model.forward_with_cfg(z, t_batch, y, cfg_scale=cfg_scale)
@@ -208,6 +209,11 @@ if __name__ == "__main__":
     parser.add_argument('--cfg_scale', type=float, default=1.0,
                         help='CFG guidance scale (1.0 = no guidance, recommended: 3.0-5.0 for sharper outputs)')
     
+    # Precision
+    parser.add_argument('--no-fp16', dest='fp16', action='store_false',
+                        help='Disable mixed precision inference (use full FP32, must match training)')
+    parser.set_defaults(fp16=True)
+    
     args = parser.parse_args()
     
     # Load Model - determine configuration based on dataset_mode
@@ -255,9 +261,13 @@ if __name__ == "__main__":
         print(f"Generating samples with CFG scale={args.cfg_scale}...")
     else:
         print("Generating samples...")
+    
+    if not args.fp16:
+        print("Using FP32 inference (--no-fp16)")
+        
     samples = sample(model, args.num_samples, dataset_mode=args.dataset_mode, 
                     pred_mode=args.pred_mode, noise_scale=args.noise_scale, 
-                    device=args.device, cfg_scale=args.cfg_scale)
+                    device=args.device, cfg_scale=args.cfg_scale, use_fp16=args.fp16)
     
     save_audio(samples, args.dataset_mode, args.output_dir, device=args.device)
     print(f"Saved to {args.output_dir}")
