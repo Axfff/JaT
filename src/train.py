@@ -438,7 +438,9 @@ def train(args):
                 # Loss
                 if args.loss_type == 'epsilon_epsilon_loss':
                     target = noise
-                    loss = F.mse_loss(model_output, target)
+                    loss_time = F.mse_loss(model_output, target)
+                    loss_spec = torch.tensor(0.0, device=device)
+                    loss = loss_time
                 elif args.loss_type == 'v_v_loss':
                     # Direct v-prediction: Model predicts v directly
                     v_pred = model_output
@@ -448,7 +450,9 @@ def train(args):
                     v_target = x - noise
                     
                     # Compute Loss
-                    loss = F.mse_loss(v_pred, v_target)
+                    loss_time = F.mse_loss(v_pred, v_target)
+                    loss_spec = torch.tensor(0.0, device=device)
+                    loss = loss_time
                 elif args.loss_type == 'x_v_loss':
                     # 1. JI-T Philosophy: The Network predicts X (Clean Audio)
                     x_pred = model_output 

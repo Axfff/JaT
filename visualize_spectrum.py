@@ -340,7 +340,7 @@ def main():
                         choices=['raw', 'spectrogram', 'spectrum_1d'],
                         help='Dataset mode: raw waveform, spectrogram, or spectrum_1d')
     parser.add_argument('--pred_mode', type=str, default='x', 
-                        choices=['epsilon', 'x', 'v'],
+                        choices=['epsilon', 'x', 'v', 'epsilon_epsilon_loss', 'v_v_loss', 'x_v_loss'],
                         help='Prediction mode for the model')
     parser.add_argument('--num_samples', type=int, default=16,
                         help='Number of samples to generate and compare')
