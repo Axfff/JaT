@@ -38,7 +38,7 @@ def load_vocoder(device='cuda'):
 
 
 
-def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0, use_fp16=True):
+def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0, use_fp16=True, sampler='euler'):
     """
     Generate samples using Flow Matching with optional Classifier-Free Guidance.
     
@@ -52,6 +52,7 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
         noise_scale: Scale for initial noise
         cfg_scale: CFG guidance scale (1.0 = no guidance, >1.0 = stronger guidance)
         use_fp16: Whether to use FP16 mixed precision (default: True)
+        sampler: Sampling method ('euler' or 'heun')
     """
     model.eval()
     
@@ -69,38 +70,56 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
     
     y = torch.randint(0, 35, (num_samples,), device=device)
     
+    def compute_velocity(z_in, t_val):
+        """Compute velocity at given state and time."""
+        t_batch = torch.ones(num_samples, device=device) * t_val
+        
+        with autocast(enabled=(use_fp16 and device != 'cpu')):
+            if cfg_scale > 1.0:
+                model_out = model.forward_with_cfg(z_in, t_batch, y, cfg_scale=cfg_scale)
+            else:
+                model_out = model(z_in, t_batch, y)
+        
+        # Calculate v based on prediction mode
+        view_shape = [t_batch.shape[0]] + [1] * (z_in.dim() - 1)
+        t_view = t_batch.view(*view_shape)
+        
+        if pred_mode == 'epsilon' or pred_mode == 'epsilon_epsilon_loss':
+            eps = model_out
+            v = (z_in - eps) / torch.maximum(t_view, torch.tensor(1e-3, device=device))
+        elif pred_mode == 'x' or pred_mode == 'x_v_loss':
+            x = model_out
+            v = (x - z_in) / torch.maximum(1 - t_view, torch.tensor(1e-5, device=device))
+        elif pred_mode == 'v' or pred_mode == 'v_v_loss':
+            v = model_out
+        else:
+            raise ValueError(f"Unknown pred_mode: {pred_mode}")
+        
+        return v
+    
     with torch.no_grad():
         for i in range(steps - 1):
             t = ts[i]
-            t_batch = torch.ones(num_samples, device=device) * t
+            t_next = ts[i + 1]
             
-            # Model input t in [0, 1] (raw, not scaled)
-            with autocast(enabled=(use_fp16 and device!='cpu')):
-                if cfg_scale > 1.0:
-                    # CFG: Run model twice (conditional and unconditional)
-                    model_out = model.forward_with_cfg(z, t_batch, y, cfg_scale=cfg_scale)
-                else:
-                    model_out = model(z, t_batch, y)
-            
-            # Calculate v based on prediction mode
-            if pred_mode == 'epsilon' or pred_mode == 'epsilon_epsilon_loss':
-                eps = model_out
-                # v = (z - eps) / t for Flow Matching
-                view_shape = [t_batch.shape[0]] + [1] * (z.dim() - 1)
-                t_view = t_batch.view(*view_shape)
-                v = (z - eps) / torch.maximum(t_view, torch.tensor(1e-3, device=device))
+            if sampler == 'euler':
+                # Euler method (1st order)
+                v = compute_velocity(z, t)
+                z = z + v * dt
                 
-            elif pred_mode == 'x' or pred_mode == 'x_v_loss':
-                x = model_out
-                # v = (x - z_t) / (1 - t)
-                view_shape = [t_batch.shape[0]] + [1] * (z.dim() - 1)
-                t_view = t_batch.view(*view_shape)
-                v = (x - z) / torch.maximum(1 - t_view, torch.tensor(1e-5, device=device))
+            elif sampler == 'heun':
+                # Heun's method (2nd order Runge-Kutta)
+                # Step 1: Euler prediction
+                v1 = compute_velocity(z, t)
+                z_pred = z + v1 * dt
                 
-            elif pred_mode == 'v' or pred_mode == 'v_v_loss':
-                v = model_out
-            
-            z = z + v * dt
+                # Step 2: Corrector using velocity at predicted point
+                v2 = compute_velocity(z_pred, t_next)
+                
+                # Step 3: Average the two velocities
+                z = z + (v1 + v2) * 0.5 * dt
+            else:
+                raise ValueError(f"Unknown sampler: {sampler}. Choose 'euler' or 'heun'.")
             
     return z
 
@@ -211,6 +230,10 @@ if __name__ == "__main__":
     parser.add_argument('--cfg_scale', type=float, default=1.0,
                         help='CFG guidance scale (1.0 = no guidance, recommended: 3.0-5.0 for sharper outputs)')
     
+    # Sampler
+    parser.add_argument('--sampler', type=str, default='euler', choices=['euler', 'heun'],
+                        help='Sampling method: euler (1st order, faster) or heun (2nd order, better quality)')
+    
     # Precision
     parser.add_argument('--no-fp16', dest='fp16', action='store_false',
                         help='Disable mixed precision inference (use full FP32, must match training)')
@@ -288,9 +311,12 @@ if __name__ == "__main__":
     if not args.fp16:
         print("Using FP32 inference (--no-fp16)")
         
+    print(f"Using sampler: {args.sampler}")
+        
     samples = sample(model, args.num_samples, dataset_mode=args.dataset_mode, 
                     pred_mode=args.pred_mode, noise_scale=args.noise_scale, 
-                    device=args.device, cfg_scale=args.cfg_scale, use_fp16=args.fp16)
+                    device=args.device, cfg_scale=args.cfg_scale, use_fp16=args.fp16,
+                    sampler=args.sampler)
     
     save_audio(samples, args.dataset_mode, args.output_dir, device=args.device)
     print(f"Saved to {args.output_dir}")
