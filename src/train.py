@@ -23,22 +23,27 @@ class EMA:
     factor after each optimizer step. EMA weights typically produce smoother
     and more stable results for inference.
     
+    IMPORTANT: Parameters are stored as a dict keyed by name to ensure correct
+    matching during checkpoint load/save, avoiding misalignment bugs.
+    
     Args:
         model: The model to track
         decay: EMA decay rate (default: 0.9999, higher = slower update)
     """
     def __init__(self, model, decay=0.9999):
         self.decay = decay
-        # Clone parameters and detach from computation graph
-        self.params = [p.clone().detach() for p in model.parameters()]
-        for p in self.params:
-            p.requires_grad = False
+        # Store parameters as dict keyed by name for exact matching on load
+        self.params = {}
+        for name, p in model.named_parameters():
+            self.params[name] = p.clone().detach()
+            self.params[name].requires_grad = False
     
     @torch.no_grad()
     def update(self, model):
         """Update EMA parameters with current model parameters."""
-        for ema_p, model_p in zip(self.params, model.parameters()):
-            ema_p.mul_(self.decay).add_(model_p, alpha=1 - self.decay)
+        for name, model_p in model.named_parameters():
+            if name in self.params:
+                self.params[name].mul_(self.decay).add_(model_p, alpha=1 - self.decay)
     
     def state_dict(self):
         """Return state dict for checkpointing."""
@@ -51,8 +56,9 @@ class EMA:
     
     def apply_to(self, model):
         """Copy EMA parameters to model (for inference)."""
-        for ema_p, model_p in zip(self.params, model.parameters()):
-            model_p.data.copy_(ema_p)
+        for name, model_p in model.named_parameters():
+            if name in self.params:
+                model_p.data.copy_(self.params[name])
 
 
 # --- Cosine Schedule for t sampling ---
@@ -72,6 +78,50 @@ def cosine_schedule(t, s=0.008):
     """
     # Cosine schedule: more samples near t=0 (clean data)
     return torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
+
+
+# --- Min-SNR Weighting ---
+def min_snr_weight(t, gamma=5.0, eps=1e-6):
+    """
+    Compute min-SNR weighting for Flow Matching loss.
+    
+    From "Efficient Diffusion Training via Min-SNR Weighting Strategy":
+    - Reweights loss at each timestep based on signal-to-noise ratio
+    - Stabilizes training and speeds up convergence
+    - Particularly helpful for v-prediction
+    
+    For Flow Matching with z_t = t * x_0 + (1-t) * noise:
+    - Signal coefficient = t (contribution from clean data)
+    - Noise coefficient = (1-t) (contribution from noise)
+    - SNR(t) = t² / (1-t)²
+    
+    Weight = min(SNR, gamma) / SNR
+    - When SNR < gamma: weight = 1 (no change)
+    - When SNR > gamma: weight = gamma / SNR (reduces weight)
+    
+    This downweights the "easy" timesteps (high SNR, near t=1) and
+    focuses training on the difficult ones (low SNR, near t=0).
+    
+    Args:
+        t: Timesteps in [0, 1], shape [B]
+        gamma: SNR clipping threshold (default: 5.0, paper recommends 5)
+        eps: Small value to prevent division by zero
+        
+    Returns:
+        Weights of shape [B], ready for broadcasting
+    """
+    # Clamp t away from boundaries to prevent extreme SNR values
+    t_clamped = torch.clamp(t, min=eps, max=1 - eps)
+    
+    # SNR = (signal coefficient)² / (noise coefficient)² = t² / (1-t)²
+    snr = (t_clamped ** 2) / ((1 - t_clamped) ** 2)
+    
+    # min-SNR weight: min(SNR, gamma) / SNR
+    # = 1 when SNR <= gamma (no change for hard timesteps)
+    # = gamma / SNR when SNR > gamma (downweight easy timesteps)
+    weight = torch.clamp(snr, max=gamma) / snr
+    
+    return weight
 
 
 # --- Multi-Scale Spectral Loss for Audio ---
@@ -408,6 +458,9 @@ def train(args):
         ema = EMA(model, decay=args.ema_decay)
         print(f"Using EMA with decay={args.ema_decay}")
     
+    if args.min_snr_gamma > 0:
+        print(f"Using Min-SNR weighting with gamma={args.min_snr_gamma}")
+    
     model.train()
     
     start_epoch = 0
@@ -489,10 +542,21 @@ def train(args):
                         f"({'16384 for raw audio' if args.dataset_mode == 'raw' else f'{args.freq_bins}x{args.time_frames} for spectrogram'})."
                     )
                 
+                # Compute min-SNR weight if enabled (gamma > 0)
+                snr_weight = None
+                if args.min_snr_gamma > 0:
+                    snr_weight = min_snr_weight(t, gamma=args.min_snr_gamma)
+                    # Reshape for broadcasting: [B] -> [B, 1, 1, ...]
+                    snr_weight = snr_weight.view(*([t.shape[0]] + [1] * (x.dim() - 1)))
+                
                 # Loss
                 if args.loss_type == 'epsilon_epsilon_loss':
                     target = noise
-                    loss_time = F.mse_loss(model_output, target)
+                    if snr_weight is not None:
+                        # Weighted MSE: mean((pred - target)^2 * weight)
+                        loss_time = (F.mse_loss(model_output, target, reduction='none') * snr_weight).mean()
+                    else:
+                        loss_time = F.mse_loss(model_output, target)
                     loss_spec = torch.tensor(0.0, device=device)
                     loss = loss_time
                 elif args.loss_type == 'v_v_loss':
@@ -503,8 +567,11 @@ def train(args):
                     # v = x - epsilon
                     v_target = x - noise
                     
-                    # Compute Loss
-                    loss_time = F.mse_loss(v_pred, v_target)
+                    # Compute Loss (with optional min-SNR weighting)
+                    if snr_weight is not None:
+                        loss_time = (F.mse_loss(v_pred, v_target, reduction='none') * snr_weight).mean()
+                    else:
+                        loss_time = F.mse_loss(v_pred, v_target)
                     loss_spec = torch.tensor(0.0, device=device)
                     loss = loss_time
                 elif args.loss_type == 'x_v_loss':
@@ -532,8 +599,11 @@ def train(args):
                     # v = x - epsilon [cite: 120]
                     v_target = x - noise
                     
-                    # 6. Compute Loss (in float32 for numerical stability)
-                    loss_time = F.mse_loss(v_pred.float(), v_target.float())
+                    # 6. Compute Loss (in float32 for numerical stability, with optional min-SNR)
+                    if snr_weight is not None:
+                        loss_time = (F.mse_loss(v_pred.float(), v_target.float(), reduction='none') * snr_weight).mean()
+                    else:
+                        loss_time = F.mse_loss(v_pred.float(), v_target.float())
                     
                     # 7. Add Multi-Scale Spectral Loss for raw audio (if enabled)
                     # This guides the model to preserve high-frequency content
@@ -728,6 +798,10 @@ if __name__ == "__main__":
     # EMA (Exponential Moving Average)
     parser.add_argument('--ema_decay', type=float, default=0.9999,
                         help='EMA decay rate (0 to disable, default: 0.9999)')
+    
+    # Min-SNR Weighting
+    parser.add_argument('--min_snr_gamma', type=float, default=0.0,
+                        help='Min-SNR gamma for loss weighting (0 to disable, paper recommends 5.0)')
     
     args = parser.parse_args()
     train(args)

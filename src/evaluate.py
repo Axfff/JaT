@@ -289,10 +289,27 @@ if __name__ == "__main__":
     if isinstance(checkpoint, dict) and 'model' in checkpoint:
         if args.use_ema and 'ema' in checkpoint:
             print("Loading EMA weights for inference...")
-            # Apply EMA params directly to model
             ema_params = checkpoint['ema']['params']
-            for p, ema_p in zip(model.parameters(), ema_params):
-                p.data.copy_(ema_p.to(args.device))
+            
+            # Check if EMA params are stored as dict (new format) or list (legacy)
+            if isinstance(ema_params, dict):
+                # New format: match by parameter name (safe)
+                model_state = model.state_dict()
+                missing_keys = []
+                for name, model_p in model.named_parameters():
+                    if name in ema_params:
+                        model_p.data.copy_(ema_params[name].to(args.device))
+                    else:
+                        missing_keys.append(name)
+                if missing_keys:
+                    print(f"Warning: {len(missing_keys)} parameters not found in EMA state")
+            else:
+                # Legacy list format: positional matching (UNSAFE - may cause issues!)
+                print("WARNING: Checkpoint uses legacy list-based EMA format.")
+                print("         This may cause incorrect weight assignment!")
+                print("         Re-train with the updated EMA class for reliable results.")
+                for p, ema_p in zip(model.parameters(), ema_params):
+                    p.data.copy_(ema_p.to(args.device))
         else:
             model.load_state_dict(checkpoint['model'])
             if args.use_ema:
