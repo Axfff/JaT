@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
@@ -428,6 +429,40 @@ def train(args):
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     
+    # Learning Rate Scheduler
+    scheduler = None
+    if args.lr_schedule == 'cosine':
+        # Calculate total training steps/epochs
+        total_epochs = args.epochs
+        
+        if args.warmup_epochs > 0:
+            # Linear warmup + Cosine annealing
+            warmup_scheduler = LinearLR(
+                optimizer, 
+                start_factor=0.01,  # Start at 1% of lr
+                end_factor=1.0,
+                total_iters=args.warmup_epochs
+            )
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=total_epochs - args.warmup_epochs,
+                eta_min=args.lr_min
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[args.warmup_epochs]
+            )
+            print(f"Using Cosine LR schedule with {args.warmup_epochs} warmup epochs, min_lr={args.lr_min}")
+        else:
+            # Pure cosine annealing
+            scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=total_epochs,
+                eta_min=args.lr_min
+            )
+            print(f"Using Cosine LR schedule (no warmup), min_lr={args.lr_min}")
+    
     # FP16 Scaler
     scaler = GradScaler(enabled=args.fp16)
     
@@ -672,6 +707,12 @@ def train(args):
                 f.write(f'{epoch},train_avg,-1,{avg_train_time:.6f},{avg_train_spec:.6f},{avg_train_total:.6f}\n')
             print(f"\nEpoch {epoch+1} Train - Total: {avg_train_total:.4f}, Time: {avg_train_time:.4f}, Spec: {avg_train_spec:.4f}")
         
+        # Step learning rate scheduler (per epoch)
+        if scheduler is not None:
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Learning rate: {current_lr:.2e}")
+        
         # Validation loop
         if val_dataloader is not None:
             model.eval()
@@ -777,6 +818,15 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
+    
+    # Learning Rate Schedule
+    parser.add_argument('--lr_schedule', type=str, default='constant', choices=['constant', 'cosine'],
+                        help='Learning rate schedule: constant (default) or cosine')
+    parser.add_argument('--lr_min', type=float, default=1e-6,
+                        help='Minimum learning rate for cosine schedule (default: 1e-6)')
+    parser.add_argument('--warmup_epochs', type=int, default=0,
+                        help='Number of warmup epochs for cosine schedule (default: 0)')
+    
     parser.add_argument('--data_root', type=str, default='./data')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--mock', action='store_true', help='Use mock dataset')
