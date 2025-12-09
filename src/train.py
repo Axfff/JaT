@@ -705,21 +705,44 @@ def train(args):
                         model_output = model(z_t, t, y)
                     
                     # Compute validation loss (x_v_loss style for x-prediction models)
+                    # Apply min-SNR weighting to match training (for comparable metrics)
+                    snr_weight = None
+                    if args.min_snr_gamma > 0:
+                        snr_weight = min_snr_weight(t, gamma=args.min_snr_gamma)
+                        snr_weight = snr_weight.view(*([t.shape[0]] + [1] * (x.dim() - 1)))
+                    
                     if args.loss_type == 'x_v_loss':
                         x_pred = model_output
                         t_view = t.view(*([t.shape[0]] + [1] * (x.dim() - 1)))
                         denominator = torch.clamp((1 - t_view).float(), min=0.1)
                         v_pred = torch.clamp((x_pred.float() - z_t.float()) / denominator, -100.0, 100.0)
                         v_target = x - noise
-                        batch_loss_time = F.mse_loss(v_pred.float(), v_target.float())
+                        
+                        if snr_weight is not None:
+                            batch_loss_time = (F.mse_loss(v_pred.float(), v_target.float(), reduction='none') * snr_weight).mean()
+                        else:
+                            batch_loss_time = F.mse_loss(v_pred.float(), v_target.float())
                         
                         batch_loss_spec = torch.tensor(0.0, device=device)
                         if spectral_loss_fn is not None:
                             batch_loss_spec = spectral_loss_fn(x_pred.float(), x.float())
                         batch_loss_total = batch_loss_time + batch_loss_spec
+                    elif args.loss_type == 'v_v_loss':
+                        v_pred = model_output
+                        v_target = x - noise
+                        if snr_weight is not None:
+                            batch_loss_time = (F.mse_loss(v_pred, v_target, reduction='none') * snr_weight).mean()
+                        else:
+                            batch_loss_time = F.mse_loss(v_pred, v_target)
+                        batch_loss_spec = torch.tensor(0.0, device=device)
+                        batch_loss_total = batch_loss_time
                     else:
-                        # For other loss types, use simple MSE
-                        batch_loss_time = F.mse_loss(model_output, x if args.loss_type != 'epsilon_epsilon_loss' else noise)
+                        # epsilon_epsilon_loss
+                        target = noise
+                        if snr_weight is not None:
+                            batch_loss_time = (F.mse_loss(model_output, target, reduction='none') * snr_weight).mean()
+                        else:
+                            batch_loss_time = F.mse_loss(model_output, target)
                         batch_loss_spec = torch.tensor(0.0, device=device)
                         batch_loss_total = batch_loss_time
                     
