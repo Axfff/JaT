@@ -11,3 +11,5 @@ spectrum_comparisons
 __pycache__/
 test_*
 tmp_*
+*.png
+src/visualize_waveform_distribution.py
