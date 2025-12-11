@@ -125,7 +125,62 @@ def min_snr_weight(t, gamma=5.0, eps=1e-6):
     return weight
 
 
-# --- Multi-Scale Spectral Loss for Audio ---
+# --- SNR-Adaptive Loss Weighting ---
+def snr_adaptive_weights(t, spec_weight_base=1.0, time_weight_base=1.0, 
+                         t_spec_peak=0.3, t_time_peak=0.8, slope=10.0, eps=1e-6):
+    """
+    Compute SNR-adaptive weights for spectral and time-domain losses.
+    
+    Intuition:
+    - Low SNR (t near 0, very noisy): Waveform MSE is mostly noise; spectral 
+      envelope & energy are meaningful → spectral loss should dominate.
+    - Mid SNR: Both are useful for learning correct envelope and waveform.
+    - High SNR (t near 1, mostly clean): Precise phase, micro-structure, and
+      killing residual noise matter → time-domain MSE should dominate.
+    
+    Implementation:
+    - Spectral weight peaks at low t (noisy), decreases towards t=1
+    - Time weight peaks at high t (clean), decreases towards t=0
+    - Uses smooth sigmoid transitions for stable gradients
+    
+    For Flow Matching: z_t = t * x_0 + (1-t) * noise
+    - t=0: pure noise (low SNR) → spec dominates
+    - t=1: pure signal (high SNR) → time dominates
+    
+    Args:
+        t: Timesteps in [0, 1], shape [B]
+        spec_weight_base: Base weight for spectral loss (default: 1.0)
+        time_weight_base: Base weight for time loss (default: 1.0)
+        t_spec_peak: t value where spectral weight is at 50% (default: 0.3)
+        t_time_peak: t value where time weight is at 50% (default: 0.8)
+        slope: Controls sharpness of transition (default: 10.0, higher = sharper)
+        eps: Small value for numerical stability
+        
+    Returns:
+        Tuple of (time_weight, spec_weight), each of shape [B]
+    """
+    # Clamp t for numerical stability
+    t_clamped = torch.clamp(t, min=eps, max=1 - eps)
+    
+    # Spectral weight: high at low t (noisy), low at high t (clean)
+    # sigmoid((t_spec_peak - t) * slope) → 1 when t << t_spec_peak, 0 when t >> t_spec_peak
+    spec_weight = spec_weight_base * torch.sigmoid((t_spec_peak - t_clamped) * slope)
+    
+    # Time weight: low at low t (noisy), high at high t (clean)
+    # sigmoid((t - t_time_peak) * slope) → 0 when t << t_time_peak, 1 when t >> t_time_peak
+    # But we want time loss to still contribute at mid-t, so use different formulation:
+    # Time weight ramps up as t increases
+    time_weight = time_weight_base * torch.sigmoid((t_clamped - t_time_peak) * slope)
+    
+    # Ensure minimum weights so neither loss ever completely vanishes
+    # This keeps gradients flowing from both terms throughout training
+    min_weight = 0.1
+    spec_weight = spec_weight + min_weight * spec_weight_base
+    time_weight = time_weight + min_weight * time_weight_base
+    
+    return time_weight, spec_weight
+
+
 class MultiScaleSpectralLoss(nn.Module):
     """
     Multi-scale spectral loss to improve audio fidelity.
@@ -540,6 +595,8 @@ def train(args):
         log_msg = "log-scale" if args.spectral_log_scale else "linear-scale"
         nf_msg = f", noise-floor weight={args.noise_floor_weight}" if args.use_noise_floor else ""
         print(f"Using Multi-Scale Spectral Loss ({log_msg}) with weight={args.spectral_loss_weight}{nf_msg}")
+        if args.use_snr_adaptive:
+            print(f"  SNR-adaptive weighting: spec peaks at t<{args.snr_adaptive_t_spec}, time peaks at t>{args.snr_adaptive_t_time}")
     
     # EMA (Exponential Moving Average)
     ema = None
@@ -700,7 +757,26 @@ def train(args):
                     if spectral_loss_fn is not None:
                         # Spectral loss on predicted clean audio vs target clean audio
                         loss_spec = spectral_loss_fn(x_pred.float(), x.float())
-                        loss = loss_time + loss_spec
+                        
+                        # SNR-adaptive loss weighting: 
+                        # - At low t (noisy): spectral loss dominates (coarse envelope matters)
+                        # - At high t (clean): time-domain loss dominates (precise phase matters)
+                        if args.use_snr_adaptive:
+                            time_weight, spec_weight = snr_adaptive_weights(
+                                t,
+                                spec_weight_base=args.snr_adaptive_spec_base,
+                                time_weight_base=args.snr_adaptive_time_base,
+                                t_spec_peak=args.snr_adaptive_t_spec,
+                                t_time_peak=args.snr_adaptive_t_time,
+                                slope=args.snr_adaptive_slope
+                            )
+                            # Reshape for broadcasting: [B] -> [B, 1, ...]
+                            time_weight = time_weight.view(*([t.shape[0]] + [1] * (x.dim() - 1)))
+                            spec_weight = spec_weight.mean()  # Average across batch for consistent spectral weight
+                            
+                            loss = time_weight.mean() * loss_time + spec_weight * loss_spec
+                        else:
+                            loss = loss_time + loss_spec
                     else:
                         loss = loss_time
                 else:
@@ -932,6 +1008,20 @@ if __name__ == "__main__":
     parser.add_argument('--noise_floor_sharpness', type=float, default=10.0,
                         help='Sharpness of sigmoid mask transition (default: 10.0, higher = sharper)')
     
+    # SNR-adaptive loss weighting (spec dominates at low SNR, time at high SNR)
+    parser.add_argument('--use_snr_adaptive', action='store_true', default=False,
+                        help='Use SNR-adaptive weighting for spectral vs time-domain loss')
+    parser.add_argument('--snr_adaptive_spec_base', type=float, default=1.0,
+                        help='Base weight for spectral loss in SNR-adaptive mode (default: 1.0)')
+    parser.add_argument('--snr_adaptive_time_base', type=float, default=1.0,
+                        help='Base weight for time loss in SNR-adaptive mode (default: 1.0)')
+    parser.add_argument('--snr_adaptive_t_spec', type=float, default=0.3,
+                        help='t value where spectral weight is at 50%% (default: 0.3, lower = spec active longer)')
+    parser.add_argument('--snr_adaptive_t_time', type=float, default=0.8,
+                        help='t value where time weight is at 50%% (default: 0.8, higher = time active later)')
+    parser.add_argument('--snr_adaptive_slope', type=float, default=10.0,
+                        help='Sharpness of weight transitions (default: 10.0, higher = sharper)')
+
     # EMA (Exponential Moving Average)
     parser.add_argument('--ema_decay', type=float, default=0.9999,
                         help='EMA decay rate (0 to disable, default: 0.9999)')
