@@ -134,18 +134,33 @@ class MultiScaleSpectralLoss(nn.Module):
     This guides the model to preserve high-frequency content that MSE 
     on waveforms tends to blur out.
     
+    Noise-floor-aware mode: Adds an extra term that penalizes predicted magnitude
+    in regions where ground truth is near silent. This explicitly kills hiss in
+    gaps between syllables and removes "electronic" buzz in nominally silent bins.
+    
     Args:
         fft_sizes: List of FFT window sizes to use (default: [512, 1024, 2048])
         hop_ratio: Hop length as ratio of FFT size (default: 0.25)
         weight: Weight for the spectral loss term (default: 0.1)
         use_log: If True, compute loss on log-magnitude (reduces penalty on loud signals)
+        use_noise_floor: If True, add noise-floor-aware penalty (default: False)
+        noise_floor_weight: Weight for the noise-floor term (default: 0.5)
+        noise_floor_thresh_ratio: Threshold as fraction of mean magnitude (default: 0.1)
+        noise_floor_sharpness: Sharpness of sigmoid mask transition (default: 10.0)
     """
-    def __init__(self, fft_sizes=[64, 128, 256, 512, 1024, 2048], hop_ratio=0.25, weight=0.1, use_log=False):
+    def __init__(self, fft_sizes=[64, 128, 256, 512, 1024, 2048], hop_ratio=0.25, weight=0.1, use_log=False,
+                 use_noise_floor=False, noise_floor_weight=0.5, noise_floor_thresh_ratio=0.1, noise_floor_sharpness=10.0):
         super().__init__()
         self.fft_sizes = fft_sizes
         self.hop_ratio = hop_ratio
         self.weight = weight
         self.use_log = use_log
+        
+        # Noise-floor-aware parameters
+        self.use_noise_floor = use_noise_floor
+        self.noise_floor_weight = noise_floor_weight
+        self.noise_floor_thresh_ratio = noise_floor_thresh_ratio
+        self.noise_floor_sharpness = noise_floor_sharpness
         
         # Adaptive epsilon: smaller FFT sizes need larger eps to prevent gradient explosion
         # This is because smaller FFTs have less energy per bin (more spread out)
@@ -188,7 +203,9 @@ class MultiScaleSpectralLoss(nn.Module):
         pred_wave = pred_wave.float()
         target_wave = target_wave.float()
         
-        loss = 0.0
+        loss_base = 0.0
+        loss_noise_floor = 0.0
+        
         for fft_size in self.fft_sizes:
             hop_length = int(fft_size * self.hop_ratio)
             window = getattr(self, f'window_{fft_size}')
@@ -217,6 +234,10 @@ class MultiScaleSpectralLoss(nn.Module):
             pred_spec = pred_spec / norm_factor
             target_spec = target_spec / norm_factor
             
+            # Store original (linear) target_spec for noise-floor computation
+            target_spec_linear = target_spec
+            pred_spec_linear = pred_spec
+            
             if self.use_log:
                 # Log-scale spectral loss: reduces penalty on loud signals,
                 # balances training across frequencies
@@ -232,10 +253,38 @@ class MultiScaleSpectralLoss(nn.Module):
                 target_spec = torch.clamp(target_spec, min=-10.0, max=10.0)
             
             # L1 loss on magnitude (ignores phase misalignment)
-            loss += F.l1_loss(pred_spec, target_spec)
+            loss_base += F.l1_loss(pred_spec, target_spec)
+            
+            # Noise-floor-aware penalty: penalize predicted magnitude where GT is quiet
+            # This kills hiss in silent gaps and electronic buzz in nominally silent bins
+            if self.use_noise_floor:
+                # Compute threshold based on per-sample mean magnitude
+                # thresh = noise_floor_thresh_ratio * mean(target_spec_linear)
+                # Shape: [B, 1, 1] for broadcasting
+                thresh = self.noise_floor_thresh_ratio * target_spec_linear.mean(dim=(1, 2), keepdim=True)
+                
+                # Smooth sigmoid mask: 1 where GT is quiet, 0 where GT is loud
+                # silence_mask = sigmoid((thresh - spec_gt) * k)
+                # When spec_gt << thresh: positive input -> sigmoid ~1 (quiet region)
+                # When spec_gt >> thresh: negative input -> sigmoid ~0 (loud region)
+                silence_mask = torch.sigmoid((thresh - target_spec_linear) * self.noise_floor_sharpness)
+                
+                # Penalize predicted magnitude only in quiet regions
+                # Higher pred_spec_linear in silent regions = higher penalty
+                loss_noise_floor += (silence_mask * pred_spec_linear).mean()
         
-        # Average over number of scales and apply weight
-        return self.weight * (loss / len(self.fft_sizes))
+        # Average over number of scales
+        loss_base = loss_base / len(self.fft_sizes)
+        
+        # Combine losses
+        if self.use_noise_floor:
+            loss_noise_floor = loss_noise_floor / len(self.fft_sizes)
+            total_loss = loss_base + self.noise_floor_weight * loss_noise_floor
+        else:
+            total_loss = loss_base
+        
+        # Apply weight and return
+        return self.weight * total_loss
 
 
 # --- Noise Scheduler ---
@@ -482,10 +531,15 @@ def train(args):
         spectral_loss_fn = MultiScaleSpectralLoss(
             fft_sizes=[64, 128, 256, 512, 1024, 2048],
             weight=args.spectral_loss_weight,
-            use_log=args.spectral_log_scale
+            use_log=args.spectral_log_scale,
+            use_noise_floor=args.use_noise_floor,
+            noise_floor_weight=args.noise_floor_weight,
+            noise_floor_thresh_ratio=args.noise_floor_thresh,
+            noise_floor_sharpness=args.noise_floor_sharpness
         ).to(device)
         log_msg = "log-scale" if args.spectral_log_scale else "linear-scale"
-        print(f"Using Multi-Scale Spectral Loss ({log_msg}) with weight={args.spectral_loss_weight}")
+        nf_msg = f", noise-floor weight={args.noise_floor_weight}" if args.use_noise_floor else ""
+        print(f"Using Multi-Scale Spectral Loss ({log_msg}) with weight={args.spectral_loss_weight}{nf_msg}")
     
     # EMA (Exponential Moving Average)
     ema = None
@@ -867,6 +921,16 @@ if __name__ == "__main__":
                         help='Weight for spectral loss term (default: 0.1)')
     parser.add_argument('--spectral_log_scale', action='store_true', default=False,
                         help='Use log-scale spectral loss (balances training across frequencies)')
+    
+    # Noise-floor-aware spectral loss (kills hiss in silent gaps)
+    parser.add_argument('--use_noise_floor', action='store_true', default=False,
+                        help='Add noise-floor penalty to spectral loss (penalizes energy in silent regions)')
+    parser.add_argument('--noise_floor_weight', type=float, default=0.5,
+                        help='Weight for noise-floor penalty (default: 0.5)')
+    parser.add_argument('--noise_floor_thresh', type=float, default=0.1,
+                        help='Threshold as fraction of mean magnitude (default: 0.1 = 10%% of mean)')
+    parser.add_argument('--noise_floor_sharpness', type=float, default=10.0,
+                        help='Sharpness of sigmoid mask transition (default: 10.0, higher = sharper)')
     
     # EMA (Exponential Moving Average)
     parser.add_argument('--ema_decay', type=float, default=0.9999,
