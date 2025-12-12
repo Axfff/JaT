@@ -897,7 +897,25 @@ def train(args):
                         batch_loss_spec = torch.tensor(0.0, device=device)
                         if spectral_loss_fn is not None:
                             batch_loss_spec = spectral_loss_fn(x_pred.float(), x.float())
-                        batch_loss_total = batch_loss_time + batch_loss_spec
+                            
+                            # Apply SNR-adaptive weighting to match training
+                            if args.use_snr_adaptive:
+                                time_weight, spec_weight = snr_adaptive_weights(
+                                    t,
+                                    spec_weight_base=args.snr_adaptive_spec_base,
+                                    time_weight_base=args.snr_adaptive_time_base,
+                                    t_spec_peak=args.snr_adaptive_t_spec,
+                                    t_time_peak=args.snr_adaptive_t_time,
+                                    slope=args.snr_adaptive_slope
+                                )
+                                time_weight = time_weight.view(*([t.shape[0]] + [1] * (x.dim() - 1)))
+                                spec_weight = spec_weight.mean()
+                                
+                                batch_loss_total = time_weight.mean() * batch_loss_time + spec_weight * batch_loss_spec
+                            else:
+                                batch_loss_total = batch_loss_time + batch_loss_spec
+                        else:
+                            batch_loss_total = batch_loss_time
                     elif args.loss_type == 'v_v_loss':
                         v_pred = model_output
                         v_target = x - noise
