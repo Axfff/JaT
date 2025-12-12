@@ -448,6 +448,11 @@ class FlowMatching:
 def train(args):
     device = torch.device(args.device)
     
+    # Determine number of classes based on core_classes_only flag
+    num_classes = 12 if args.core_classes_only else 35
+    if args.core_classes_only:
+        print(f"Using 12 core classes: yes, no, up, down, left, right, on, off, stop, go, unknown, silence")
+    
     # Dataset
     print(f"Loading dataset: {args.dataset_mode}")
     dataloader = get_dataloader(
@@ -457,7 +462,8 @@ def train(args):
         subset='training',
         mock=args.mock,
         freq_bins=args.freq_bins,
-        time_frames=args.time_frames
+        time_frames=args.time_frames,
+        core_classes_only=args.core_classes_only
     )
     
     # Validation dataloader (SpeechCommands validation_list.txt is speaker-disjoint)
@@ -470,7 +476,8 @@ def train(args):
             subset='validation',
             mock=False,
             freq_bins=args.freq_bins,
-            time_frames=args.time_frames
+            time_frames=args.time_frames,
+            core_classes_only=args.core_classes_only
         )
         print(f"Loaded {len(val_dataloader.dataset)} validation samples (speaker-disjoint)")
     
@@ -518,8 +525,8 @@ def train(args):
         in_channels=in_channels,
         hidden_size=args.hidden_size,
         depth=args.depth,
-        num_heads=8,  # Fixed or arg?
-        num_classes=35,
+        num_heads=args.num_heads,
+        num_classes=num_classes,
         mlp_ratio=4.0,
         bottleneck_dim=args.hidden_size,  # Default
         in_context_len=0,  # Disable in-context for now unless specified
@@ -731,7 +738,7 @@ def train(args):
                     # See paper: "clip its denominator (by default, 0.05)"
                     # FP16 FIX: Use a larger min value and compute in float32 for stability
                     denominator = (1 - t_view).float()
-                    denominator = torch.clamp(denominator, min=0.1)  # Larger min for FP16 stability
+                    denominator = torch.clamp(denominator, min=0.05)  # Larger min for FP16 stability
                     
                     # 4. Calculate Velocity Prediction (Formula from Eq. 6)
                     # v_pred = (x_pred - z_t) / (1 - t)
@@ -976,6 +983,8 @@ if __name__ == "__main__":
                         help='Number of warmup epochs for cosine schedule (default: 0)')
     
     parser.add_argument('--data_root', type=str, default='./data')
+    parser.add_argument('--core_classes_only', action='store_true', default=False,
+                        help='Use only 12 core classes (yes, no, up, down, left, right, on, off, stop, go, unknown, silence)')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--mock', action='store_true', help='Use mock dataset')
     parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint to resume from')
@@ -983,6 +992,7 @@ if __name__ == "__main__":
     # Model Capacity
     parser.add_argument('--hidden_size', type=int, default=512, help='Model hidden size')
     parser.add_argument('--depth', type=int, default=12, help='Model depth (number of layers)')
+    parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
     
     # Spectrum resolution (for spectrogram and spectrum_1d modes)
     parser.add_argument('--freq_bins', type=int, default=64,

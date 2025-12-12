@@ -38,7 +38,7 @@ def load_vocoder(device='cuda'):
 
 
 
-def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0, use_fp16=True, sampler='euler'):
+def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0, use_fp16=True, sampler='euler', num_classes=35):
     """
     Generate samples using Flow Matching with optional Classifier-Free Guidance.
     
@@ -68,7 +68,7 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
     ts = torch.linspace(0, 1, steps, device=device)
     dt = ts[1] - ts[0]
     
-    y = torch.randint(0, 35, (num_samples,), device=device)
+    y = torch.randint(0, num_classes, (num_samples,), device=device)
     
     def compute_velocity(z_in, t_val):
         """Compute velocity at given state and time."""
@@ -217,6 +217,7 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--hidden_size', type=int, default=512, help='Model hidden size')
     parser.add_argument('--depth', type=int, default=12, help='Model depth')
+    parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
     parser.add_argument('--bottleneck_dim', type=int, default=None, help='Bottleneck dimension (default: hidden_size)')
     parser.add_argument('--in_context_len', type=int, default=0, help='In-context length')
     
@@ -225,10 +226,16 @@ if __name__ == "__main__":
                         help='Use Snake activation (must match training config)')
     parser.add_argument('--freq_bins', type=int, default=64, help='Number of frequency bins (for spectrum_1d mode)')
     parser.add_argument('--time_frames', type=int, default=64, help='Number of time frames (for spectrum_1d mode)')
+    parser.add_argument('--core_classes_only', action='store_true', default=False,
+                        help='Use only 12 core classes (must match training config)')
     
     # Classifier-Free Guidance
     parser.add_argument('--cfg_scale', type=float, default=1.0,
                         help='CFG guidance scale (1.0 = no guidance, recommended: 3.0-5.0 for sharper outputs)')
+    
+    # Sampling steps
+    parser.add_argument('--steps', type=int, default=50,
+                        help='Number of sampling steps (default: 50)')
     
     # Sampler
     parser.add_argument('--sampler', type=str, default='euler', choices=['euler', 'heun'],
@@ -265,6 +272,11 @@ if __name__ == "__main__":
         raise ValueError(f"Unknown dataset_mode: {args.dataset_mode}")
         
     bottleneck_dim = args.bottleneck_dim if args.bottleneck_dim is not None else args.hidden_size
+    
+    # Determine number of classes based on core_classes_only flag
+    num_classes = 12 if args.core_classes_only else 35
+    if args.core_classes_only:
+        print(f"Using 12 core classes mode")
 
     model = JiT(
         input_size=input_size,
@@ -272,8 +284,8 @@ if __name__ == "__main__":
         in_channels=in_channels,
         hidden_size=args.hidden_size,
         depth=args.depth,
-        num_heads=8,
-        num_classes=35,
+        num_heads=args.num_heads,
+        num_classes=num_classes,
         bottleneck_dim=bottleneck_dim,
         in_context_len=args.in_context_len,
         is_1d=is_1d,
@@ -328,12 +340,12 @@ if __name__ == "__main__":
     if not args.fp16:
         print("Using FP32 inference (--no-fp16)")
         
-    print(f"Using sampler: {args.sampler}")
+    print(f"Using sampler: {args.sampler} with {args.steps} steps")
         
-    samples = sample(model, args.num_samples, dataset_mode=args.dataset_mode, 
+    samples = sample(model, args.num_samples, steps=args.steps, dataset_mode=args.dataset_mode, 
                     pred_mode=args.pred_mode, noise_scale=args.noise_scale, 
                     device=args.device, cfg_scale=args.cfg_scale, use_fp16=args.fp16,
-                    sampler=args.sampler)
+                    sampler=args.sampler, num_classes=num_classes)
     
     save_audio(samples, args.dataset_mode, args.output_dir, device=args.device)
     print(f"Saved to {args.output_dir}")

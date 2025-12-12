@@ -17,6 +17,14 @@ except:
 NORM_MEAN = -5.0
 NORM_STD = 3.0
 
+# SpeechCommands 12 Core Classes (10 command words + unknown + silence)
+# These are the standard evaluation classes for keyword spotting benchmarks
+CORE_CLASSES = [
+    "yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go",  # 10 core commands
+    "unknown",  # All other words (bed, bird, cat, dog, etc.)
+    "silence"   # Background noise / silence
+]
+
 def normalize_spectrogram(spec):
     """
     Normalize spectrogram using fixed global statistics.
@@ -53,7 +61,7 @@ def denormalize_spectrogram(norm_spec):
     return spec
 
 class SpeechCommandsDataset(Dataset):
-    def __init__(self, root, mode='raw', subset='training', download=True, mock=False, freq_bins=64, time_frames=64):
+    def __init__(self, root, mode='raw', subset='training', download=True, mock=False, freq_bins=64, time_frames=64, core_classes_only=False):
         """
         Args:
             root (str): Root directory for the dataset.
@@ -61,6 +69,12 @@ class SpeechCommandsDataset(Dataset):
             subset (str): 'training', 'validation', or 'testing'.
             download (bool): Whether to download the dataset.
             mock (bool): Whether to use mock data.
+            freq_bins (int): Number of mel frequency bins.
+            time_frames (int): Number of time frames.
+            core_classes_only (bool): If True, use only 12 core classes 
+                (yes, no, up, down, left, right, on, off, stop, go, unknown, silence).
+                Non-core words are mapped to 'unknown', silence samples from 
+                _background_noise_ are mapped to 'silence'.
         """
         self.mode = mode
         self.subset = subset
@@ -71,6 +85,10 @@ class SpeechCommandsDataset(Dataset):
         self.mock = mock
         self.freq_bins = freq_bins
         self.time_frames = time_frames
+        self.core_classes_only = core_classes_only
+        
+        # Define the 10 core command words (used for mapping)
+        self.core_commands = {"yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"}
         
         if self.mock:
             self.dataset = list(range(100)) # 100 mock samples
@@ -90,15 +108,23 @@ class SpeechCommandsDataset(Dataset):
         
         # Build label map
         if self.mock:
-            self.all_labels = ["bed", "cat", "down"]
+            if core_classes_only:
+                self.all_labels = CORE_CLASSES
+            else:
+                self.all_labels = ["bed", "cat", "down"]
         else:
-            # We need to scan the dataset to find all labels. 
-            # This might be slow if we iterate all.
-            # But SpeechCommands structure is root/label/file.
-            # We can list directories in root/SpeechCommands/speech_commands_v0.02
-            # self.dataset._path is the path.
-            dataset_path = self.dataset._path
-            self.all_labels = sorted([d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d)) and d != '_background_noise_'])
+            if core_classes_only:
+                # Use only 12 core classes
+                self.all_labels = CORE_CLASSES
+            else:
+                # Use all 35 labels
+                # We need to scan the dataset to find all labels. 
+                # This might be slow if we iterate all.
+                # But SpeechCommands structure is root/label/file.
+                # We can list directories in root/SpeechCommands/speech_commands_v0.02
+                # self.dataset._path is the path.
+                dataset_path = self.dataset._path
+                self.all_labels = sorted([d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d)) and d != '_background_noise_'])
             
         self.label_to_idx = {label: i for i, label in enumerate(self.all_labels)}
 
@@ -159,6 +185,26 @@ class SpeechCommandsDataset(Dataset):
                     indices.append(i)
         
         return indices
+    
+    def _map_to_core_class(self, label):
+        """
+        Map a label to one of the 12 core classes.
+        
+        Args:
+            label: Original label string (e.g., "yes", "bed", "_background_noise_")
+            
+        Returns:
+            Mapped label string (one of CORE_CLASSES)
+        """
+        if label in self.core_commands:
+            # Core command word - keep as-is
+            return label
+        elif label == '_background_noise_' or label == 'silence':
+            # Background noise / silence
+            return 'silence'
+        else:
+            # All other words map to 'unknown'
+            return 'unknown'
 
     def __len__(self):
         return len(self._indices)
@@ -168,6 +214,9 @@ class SpeechCommandsDataset(Dataset):
             # Generate random waveform
             waveform = torch.randn(1, self.num_samples)
             label = "bed" # Mock label
+            # Map to core class if needed
+            if self.core_classes_only:
+                label = self._map_to_core_class(label)
             label_idx = self.label_to_idx.get(label, 0)
             
             if self.mode in ['spectrogram', 'spectrum_1d']:
@@ -191,6 +240,10 @@ class SpeechCommandsDataset(Dataset):
         # Label is directory name.
         rel_path = os.path.relpath(file_path, self.dataset._path)
         label = os.path.split(rel_path)[0]
+        
+        # Map to core class if needed
+        if self.core_classes_only:
+            label = self._map_to_core_class(label)
         
         # Load audio
         # waveform, sample_rate = torchaudio.load(file_path, backend="soundfile")
@@ -253,8 +306,8 @@ class SpeechCommandsDataset(Dataset):
             
         return waveform, self.label_to_idx.get(label, 0)
 
-def get_dataloader(root, mode='raw', subset='training', batch_size=32, num_workers=4, mock=False, freq_bins=64, time_frames=64):
-    dataset = SpeechCommandsDataset(root, mode=mode, subset=subset, mock=mock, freq_bins=freq_bins, time_frames=time_frames)
+def get_dataloader(root, mode='raw', subset='training', batch_size=32, num_workers=4, mock=False, freq_bins=64, time_frames=64, core_classes_only=False):
+    dataset = SpeechCommandsDataset(root, mode=mode, subset=subset, mock=mock, freq_bins=freq_bins, time_frames=time_frames, core_classes_only=core_classes_only)
     
     # We need to collate labels properly because they are strings.
     # Or we can convert them to indices.
