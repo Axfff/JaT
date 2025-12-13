@@ -13,3 +13,4 @@ test_*
 tmp_*
 *.png
 src/visualize_waveform_distribution.py
+src/sanity_check_labels.py

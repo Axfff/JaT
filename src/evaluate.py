@@ -38,7 +38,7 @@ def load_vocoder(device='cuda'):
 
 
 
-def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0, use_fp16=True, sampler='euler', num_classes=35):
+def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0, use_fp16=True, sampler='euler', num_classes=35, exclude_silence_unknown=False):
     """
     Generate samples using Flow Matching with optional Classifier-Free Guidance.
     
@@ -68,7 +68,12 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
     ts = torch.linspace(0, 1, steps, device=device)
     dt = ts[1] - ts[0]
     
-    y = torch.randint(0, num_classes, (num_samples,), device=device)
+    # Sample labels - optionally exclude silence (11) and unknown (10)
+    if exclude_silence_unknown and num_classes == 12:
+        # Only sample from 10 core commands (indices 0-9)
+        y = torch.randint(0, 10, (num_samples,), device=device)
+    else:
+        y = torch.randint(0, num_classes, (num_samples,), device=device)
     
     def compute_velocity(z_in, t_val):
         """Compute velocity at given state and time."""
@@ -89,7 +94,7 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
             v = (z_in - eps) / torch.maximum(t_view, torch.tensor(1e-3, device=device))
         elif pred_mode == 'x' or pred_mode == 'x_v_loss':
             x = model_out
-            v = (x - z_in) / torch.maximum(1 - t_view, torch.tensor(1e-5, device=device))
+            v = (x - z_in) / torch.maximum(1 - t_view, torch.tensor(5e-2, device=device))
         elif pred_mode == 'v' or pred_mode == 'v_v_loss':
             v = model_out
         else:
@@ -228,6 +233,8 @@ if __name__ == "__main__":
     parser.add_argument('--time_frames', type=int, default=64, help='Number of time frames (for spectrum_1d mode)')
     parser.add_argument('--core_classes_only', action='store_true', default=False,
                         help='Use only 12 core classes (must match training config)')
+    parser.add_argument('--exclude_silence_unknown', action='store_true', default=False,
+                        help='Exclude silence and unknown labels when sampling (only use 10 core commands)')
     
     # Classifier-Free Guidance
     parser.add_argument('--cfg_scale', type=float, default=1.0,
@@ -345,8 +352,8 @@ if __name__ == "__main__":
     samples = sample(model, args.num_samples, steps=args.steps, dataset_mode=args.dataset_mode, 
                     pred_mode=args.pred_mode, noise_scale=args.noise_scale, 
                     device=args.device, cfg_scale=args.cfg_scale, use_fp16=args.fp16,
-                    sampler=args.sampler, num_classes=num_classes)
+                    sampler=args.sampler, num_classes=num_classes,
+                    exclude_silence_unknown=args.exclude_silence_unknown)
     
     save_audio(samples, args.dataset_mode, args.output_dir, device=args.device)
     print(f"Saved to {args.output_dir}")
-
