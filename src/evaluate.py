@@ -94,7 +94,7 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
             v = (z_in - eps) / torch.maximum(t_view, torch.tensor(1e-3, device=device))
         elif pred_mode == 'x' or pred_mode == 'x_v_loss':
             x = model_out
-            v = (x - z_in) / torch.maximum(1 - t_view, torch.tensor(5e-2, device=device))
+            v = (x - z_in) / torch.maximum(1 - t_view, torch.tensor(1e-2, device=device))
         elif pred_mode == 'v' or pred_mode == 'v_v_loss':
             v = model_out
         else:

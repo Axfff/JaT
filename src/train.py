@@ -614,6 +614,14 @@ def train(args):
     if args.min_snr_gamma > 0:
         print(f"Using Min-SNR weighting with gamma={args.min_snr_gamma}")
     
+    # Derivative loss for transients (plosives)
+    if args.use_derivative_loss and args.dataset_mode == 'raw':
+        print(f"Using Derivative Loss with weight={args.derivative_loss_weight} (emphasizes transients/plosives)")
+    
+    # Silence penalty for reducing hiss
+    if args.use_silence_penalty and args.dataset_mode == 'raw':
+        print(f"Using Silence Penalty with weight={args.silence_penalty_weight}, threshold={args.silence_threshold}")
+    
     model.train()
     
     start_epoch = 0
@@ -738,7 +746,7 @@ def train(args):
                     # See paper: "clip its denominator (by default, 0.05)"
                     # FP16 FIX: Use a larger min value and compute in float32 for stability
                     denominator = (1 - t_view).float()
-                    denominator = torch.clamp(denominator, min=0.05)  # Larger min for FP16 stability
+                    denominator = torch.clamp(denominator, min=0.01)  # Larger min for FP16 stability
                     
                     # 4. Calculate Velocity Prediction (Formula from Eq. 6)
                     # v_pred = (x_pred - z_t) / (1 - t)
@@ -786,6 +794,33 @@ def train(args):
                             loss = loss_time + loss_spec
                     else:
                         loss = loss_time
+                    
+                    # 8. Derivative Loss: Emphasize transients (plosives) by penalizing
+                    #    differences in the time derivative (pre-emphasis)
+                    #    d(x) = x[:, 1:] - x[:, :-1]
+                    #    L_diff = λ * ||d(x_pred) - d(x_gt)||_2^2
+                    if args.use_derivative_loss and args.dataset_mode == 'raw':
+                        # Compute time derivatives (first-order difference)
+                        x_pred_flat = x_pred.view(x_pred.shape[0], -1)  # [B, L]
+                        x_flat = x.view(x.shape[0], -1)  # [B, L]
+                        
+                        d_pred = x_pred_flat[:, 1:] - x_pred_flat[:, :-1]  # [B, L-1]
+                        d_gt = x_flat[:, 1:] - x_flat[:, :-1]  # [B, L-1]
+                        
+                        loss_diff = args.derivative_loss_weight * F.mse_loss(d_pred.float(), d_gt.float())
+                        loss += loss_diff
+                    
+                    # 9. Silence Penalty: Reduce residual hiss by penalizing predicted
+                    #    energy in regions where ground truth is silent
+                    #    m = (|x_gt| < threshold)
+                    #    L_silence = β * E[m * x_pred^2]
+                    if args.use_silence_penalty and args.dataset_mode == 'raw':
+                        # Create silence mask from ground truth
+                        silence_mask = (torch.abs(x) < args.silence_threshold).float()
+                        
+                        # Penalize predicted energy in silent regions
+                        loss_silence = args.silence_penalty_weight * (silence_mask * x_pred.float() ** 2).mean()
+                        loss += loss_silence
                 else:
                     raise ValueError(f"Unknown loss type: {args.loss_type}")
             
@@ -1004,7 +1039,7 @@ if __name__ == "__main__":
     parser.add_argument('--P_mean', type=float, default=-0.8, help='Logit-normal mean for time sampling')
     parser.add_argument('--P_std', type=float, default=0.8, help='Logit-normal std for time sampling')
     parser.add_argument('--noise_scale', type=float, default=1.0, help='Noise scale factor')
-    parser.add_argument('--t_eps', type=float, default=5e-2, help='Minimum t value to avoid division by zero')
+    parser.add_argument('--t_eps', type=float, default=1e-2, help='Minimum t value to avoid division by zero')
     parser.add_argument('--no-fp16', dest='fp16', action='store_false', help='Disable mixed precision training (use full FP32)')
     parser.set_defaults(fp16=True)
     
@@ -1035,6 +1070,20 @@ if __name__ == "__main__":
                         help='Threshold as fraction of mean magnitude (default: 0.1 = 10%% of mean)')
     parser.add_argument('--noise_floor_sharpness', type=float, default=10.0,
                         help='Sharpness of sigmoid mask transition (default: 10.0, higher = sharper)')
+    
+    # Derivative Loss: Emphasize transients (plosives) by penalizing time-derivative differences
+    parser.add_argument('--use_derivative_loss', action='store_true', default=False,
+                        help='Add derivative loss to emphasize transients/plosives (raw audio only)')
+    parser.add_argument('--derivative_loss_weight', type=float, default=0.01,
+                        help='Weight for derivative loss (default: 0.01, recommended: 0.005-0.01)')
+    
+    # Silence Penalty: Reduce residual hiss by penalizing energy in silent regions
+    parser.add_argument('--use_silence_penalty', action='store_true', default=False,
+                        help='Add silence penalty to reduce hiss in quiet regions (raw audio only)')
+    parser.add_argument('--silence_penalty_weight', type=float, default=1e-4,
+                        help='Weight for silence penalty (default: 1e-4)')
+    parser.add_argument('--silence_threshold', type=float, default=0.01,
+                        help='Amplitude threshold below which samples are considered silent (default: 0.01)')
     
     # SNR-adaptive loss weighting (spec dominates at low SNR, time at high SNR)
     parser.add_argument('--use_snr_adaptive', action='store_true', default=False,
