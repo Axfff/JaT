@@ -38,7 +38,28 @@ def load_vocoder(device='cuda'):
 
 
 
-def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0, use_fp16=True, sampler='euler', num_classes=35, exclude_silence_unknown=False):
+def cfg_schedule(t, s=3.0, tau=0.7, k=10.0):
+    """
+    Time-dependent CFG schedule.
+    
+    Formula: cfg(t) = 1 + (s-1) * sigmoid(k * (t - tau))
+    
+    This starts with weak guidance near t=0 (noisy) and ramps up to 
+    full guidance scale s near t=tau, with the transition controlled by k.
+    
+    Args:
+        t: Current timestep (scalar or tensor), in [0, 1]
+        s: Maximum CFG scale (default: 3.0)
+        tau: Midpoint of the transition (default: 0.7)
+        k: Steepness of the sigmoid transition (default: 10.0)
+        
+    Returns:
+        Dynamic CFG scale at timestep t
+    """
+    return 1.0 + (s - 1.0) * torch.sigmoid(torch.tensor(k * (t - tau)))
+
+
+def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0, use_fp16=True, sampler='euler', num_classes=35, exclude_silence_unknown=False, use_cfg_schedule=False):
     """
     Generate samples using Flow Matching with optional Classifier-Free Guidance.
     
@@ -53,6 +74,7 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
         cfg_scale: CFG guidance scale (1.0 = no guidance, >1.0 = stronger guidance)
         use_fp16: Whether to use FP16 mixed precision (default: True)
         sampler: Sampling method ('euler' or 'heun')
+        use_cfg_schedule: Whether to use time-dependent CFG schedule (default: False)
     """
     model.eval()
     
@@ -79,9 +101,15 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
         """Compute velocity at given state and time."""
         t_batch = torch.ones(num_samples, device=device) * t_val
         
+        # Determine effective CFG scale (static or scheduled)
+        if use_cfg_schedule:
+            effective_cfg = cfg_schedule(t_val).item()
+        else:
+            effective_cfg = cfg_scale
+        
         with autocast(enabled=(use_fp16 and device != 'cpu')):
-            if cfg_scale > 1.0:
-                model_out = model.forward_with_cfg(z_in, t_batch, y, cfg_scale=cfg_scale)
+            if effective_cfg > 1.0:
+                model_out = model.forward_with_cfg(z_in, t_batch, y, cfg_scale=effective_cfg)
             else:
                 model_out = model(z_in, t_batch, y)
         
@@ -239,6 +267,8 @@ if __name__ == "__main__":
     # Classifier-Free Guidance
     parser.add_argument('--cfg_scale', type=float, default=1.0,
                         help='CFG guidance scale (1.0 = no guidance, recommended: 3.0-5.0 for sharper outputs)')
+    parser.add_argument('--use_cfg_schedule', action='store_true', default=False,
+                        help='Use time-dependent CFG schedule: cfg(t) = 1 + (s-1)*sigmoid(k*(t-tau)) with s=3.0, tau=0.7, k=10')
     
     # Sampling steps
     parser.add_argument('--steps', type=int, default=50,
@@ -339,10 +369,13 @@ if __name__ == "__main__":
         if args.use_ema:
             print("Warning: --use_ema specified but checkpoint is legacy format (no EMA)")
     
-    if args.cfg_scale > 1.0:
-        print(f"Generating samples with CFG scale={args.cfg_scale}...")
+    if args.use_cfg_schedule:
+        print("Generating samples with time-dependent CFG schedule: cfg(t) = 1 + (s-1)*sigmoid(k*(t-tau))")
+        print("  Parameters: s=3.0, tau=0.7, k=10")
+    elif args.cfg_scale > 1.0:
+        print(f"Generating samples with static CFG scale={args.cfg_scale}...")
     else:
-        print("Generating samples...")
+        print("Generating samples (no CFG)...")
     
     if not args.fp16:
         print("Using FP32 inference (--no-fp16)")
@@ -353,7 +386,8 @@ if __name__ == "__main__":
                     pred_mode=args.pred_mode, noise_scale=args.noise_scale, 
                     device=args.device, cfg_scale=args.cfg_scale, use_fp16=args.fp16,
                     sampler=args.sampler, num_classes=num_classes,
-                    exclude_silence_unknown=args.exclude_silence_unknown)
+                    exclude_silence_unknown=args.exclude_silence_unknown,
+                    use_cfg_schedule=args.use_cfg_schedule)
     
     save_audio(samples, args.dataset_mode, args.output_dir, device=args.device)
     print(f"Saved to {args.output_dir}")
