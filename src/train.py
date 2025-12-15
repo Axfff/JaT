@@ -795,20 +795,33 @@ def train(args):
                     else:
                         loss = loss_time
                     
-                    # 8. Derivative Loss: Emphasize transients (plosives) by penalizing
-                    #    differences in the time derivative (pre-emphasis)
-                    #    d(x) = x[:, 1:] - x[:, :-1]
-                    #    L_diff = λ * ||d(x_pred) - d(x_gt)||_2^2
+                    # 8. Pre-emphasis Loss: Emphasize high frequencies and transients
+                    #    using pre-emphasis filter: y[t] = x[t] - 0.97 * x[t-1]
+                    #    This boosts plosives/transients more effectively than simple diff
+                    #    L_preemph = λ * ||y_pred - y_gt||_2^2
                     if args.use_derivative_loss and args.dataset_mode == 'raw':
-                        # Compute time derivatives (first-order difference)
+                        # Pre-emphasis coefficient (standard value for speech)
+                        preemph_coef = 0.97
+                        
+                        # Flatten to [B, L]
                         x_pred_flat = x_pred.view(x_pred.shape[0], -1)  # [B, L]
                         x_flat = x.view(x.shape[0], -1)  # [B, L]
                         
-                        d_pred = x_pred_flat[:, 1:] - x_pred_flat[:, :-1]  # [B, L-1]
-                        d_gt = x_flat[:, 1:] - x_flat[:, :-1]  # [B, L-1]
+                        # Pre-emphasis filter: y[t] = x[t] - 0.97 * x[t-1]
+                        y_pred = x_pred_flat[:, 1:] - preemph_coef * x_pred_flat[:, :-1]  # [B, L-1]
+                        y_gt = x_flat[:, 1:] - preemph_coef * x_flat[:, :-1]  # [B, L-1]
                         
-                        loss_diff = args.derivative_loss_weight * F.mse_loss(d_pred.float(), d_gt.float())
-                        loss += loss_diff
+                        # # Optional speech masking: only penalize where GT has speech
+                        # if args.use_silence_penalty:
+                        #     # Create mask from the corresponding samples (exclude edges)
+                        #     speech_mask = (torch.abs(x_flat[:, 1:]) >= args.silence_threshold).float()
+                        #     # Masked L2 loss
+                        #     loss_preemph = args.derivative_loss_weight * ((speech_mask * (y_pred.float() - y_gt.float()) ** 2).sum() / (speech_mask.sum() + 1e-8))
+                        # else:
+                        #     loss_preemph = args.derivative_loss_weight * F.mse_loss(y_pred.float(), y_gt.float())
+                        
+                        loss_preemph = args.derivative_loss_weight * F.mse_loss(y_pred.float(), y_gt.float())
+                        loss += loss_preemph
                     
                     # 9. Silence Penalty: Reduce residual hiss by penalizing predicted
                     #    energy in regions where ground truth is silent

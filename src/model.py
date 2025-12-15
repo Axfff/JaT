@@ -716,9 +716,15 @@ class JiT(nn.Module):
             norm[start:end] += hann
         
         # Normalize by window overlap
-        # Avoid division by zero
-        norm = torch.clamp(norm, min=1e-8)
+        # CRITICAL: Hann window has zeros at edges (hann[0] = hann[-1] = 0)
+        # At signal boundaries, only one window contributes with near-zero weight
+        # This causes division by near-zero -> NaN. Fix by using a reasonable minimum.
+        # With 50% overlap, the middle of the signal has norm ~1.0, so 0.01 is safe.
+        norm = torch.clamp(norm, min=0.01)
         output = output / norm.unsqueeze(0).unsqueeze(0)  # [N, c, L] / [1, 1, L]
+        
+        # Clamp output to prevent any residual numerical issues from edge effects
+        output = torch.clamp(output, min=-10.0, max=10.0)
         
         return output
 
