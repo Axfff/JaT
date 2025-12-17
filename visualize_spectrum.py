@@ -11,8 +11,8 @@ from tqdm import tqdm
 import sys
 sys.path.append('src')
 from src.model import JiT
-from src.model import JiT
 from src.dataset import get_dataloader, SpeechCommandsDataset, normalize_spectrogram
+from src.utils import set_seed
 
 
 def waveform_to_spectrogram(waveform, sample_rate=16000):
@@ -54,7 +54,7 @@ def waveform_to_spectrogram(waveform, sample_rate=16000):
     return spec.squeeze(0)  # (64, 64)
 
 
-def load_model_predictions(checkpoint_path, dataset_mode, pred_mode, num_samples, patch_size=512, device='cuda'):
+def load_model_predictions(checkpoint_path, dataset_mode, pred_mode, num_samples, patch_size=512, device='cuda', labels=None):
     """
     Load model and generate predictions.
     
@@ -64,6 +64,7 @@ def load_model_predictions(checkpoint_path, dataset_mode, pred_mode, num_samples
         pred_mode: 'epsilon', 'x', or 'v'
         num_samples: number of samples to generate
         device: device to run on
+        labels: Optional tensor of labels to condition on
         
     Returns:
         predictions: (N, 1, L) for raw or (N, 1, 4096) for spectrogram
@@ -106,8 +107,11 @@ def load_model_predictions(checkpoint_path, dataset_mode, pred_mode, num_samples
         time_frames=64
     ).to(device)
     
-    state_dict = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state_dict)
+    if checkpoint_path is not None:
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict)
+    else:
+        print("Warning: No checkpoint provided, using random model weights (Mock Mode)")
     
     print(f"Generating {num_samples} predictions...")
     predictions = sample(
@@ -115,21 +119,24 @@ def load_model_predictions(checkpoint_path, dataset_mode, pred_mode, num_samples
         num_samples, 
         dataset_mode=dataset_mode, 
         pred_mode=pred_mode, 
-        device=device
+        device=device,
+        labels=labels
     )
     
     return predictions
 
 
-def load_groundtruth(data_root, num_samples, dataset_mode='raw', subset='testing'):
+def load_groundtruth(data_root, num_samples, dataset_mode='raw', subset='testing', target_labels=None, mock=False):
     """
     Load groundtruth samples from dataset.
     
     Args:
         data_root: root directory for dataset
-        num_samples: number of samples to load
+        num_samples: number of samples to load (ignored if target_labels is provided)
         dataset_mode: 'raw' or 'spectrogram'
         subset: 'training', 'validation', or 'testing'
+        target_labels: list of specific labels (indices) to find. If provided, num_samples is ignored.
+        mock: whether to use mock data
         
     Returns:
         gt_data: list of groundtruth samples
@@ -139,17 +146,59 @@ def load_groundtruth(data_root, num_samples, dataset_mode='raw', subset='testing
         data_root, 
         mode=dataset_mode, 
         subset=subset, 
-        download=False
+        download=False,
+        mock=mock
     )
     
     gt_data = []
     gt_labels = []
     
-    print(f"Loading {num_samples} groundtruth samples...")
-    for i in tqdm(range(min(num_samples, len(dataset)))):
-        data, label = dataset[i]
-        gt_data.append(data)
-        gt_labels.append(label)
+    if target_labels is not None:
+        print(f"Searching for {len(target_labels)} specific labels in {subset} set...")
+        # Create a set of needed labels for fast lookup
+        needed = {l: True for l in target_labels}
+        found_count = {l: 0 for l in target_labels}
+        
+        collected_samples = {} # label -> sample
+        
+        progress = tqdm(total=len(target_labels), desc="Finding samples")
+        
+        for i in range(len(dataset)):
+            if len(collected_samples) == len(target_labels):
+                break
+                
+            data, label_idx = dataset[i]
+            
+            if label_idx in needed and label_idx not in collected_samples:
+                collected_samples[label_idx] = data
+                progress.update(1)
+        
+        progress.close()
+        
+        if len(collected_samples) < len(target_labels):
+            print(f"Warning: Could not find all requested labels. Found {len(collected_samples)}/{len(target_labels)}")
+            
+        # Organize in the order of target_labels
+        for l in target_labels:
+            if l in collected_samples:
+                gt_data.append(collected_samples[l])
+                gt_labels.append(l)
+            else:
+                print(f"Missing sample for label {l}")
+                # Fallback: append the first valid sample (better than crashing)
+                if len(gt_data) > 0:
+                    gt_data.append(gt_data[0])
+                    gt_labels.append(gt_labels[0])
+                else:
+                    raise ValueError("Found NO samples matching targets.")
+
+    else:
+        # Standard sequential loading
+        print(f"Loading {num_samples} groundtruth samples...")
+        for i in tqdm(range(min(num_samples, len(dataset)))):
+            data, label = dataset[i]
+            gt_data.append(data)
+            gt_labels.append(label)
     
     return gt_data, gt_labels
 
@@ -250,6 +299,11 @@ def visualize_comparison(predictions, groundtruth, save_path, pred_is_waveform=T
         fontsize=16, 
         y=0.995
     )
+    
+    # Add label names if available (optional enhancement)
+    # We don't have label names passed here easily, but we could add them if we change signature.
+    # For now, keep as is.
+    
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"Visualization saved to {save_path}")
     plt.close()
@@ -359,10 +413,20 @@ def main():
     parser.add_argument('--patch_size', type=int, default=512,
                         help='Patch size for the model (default: 512)')
     
+    # New arguments
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--core_classes_only', action='store_true', default=False, 
+                        help='Visualize only 12 core classes (one per class)')
+    parser.add_argument('--balanced', action='store_true', default=True,
+                        help='Visualize one sample per class (default: True)')
+    parser.add_argument('--mock', action='store_true', help='Use mock dataset')
+    
     args = parser.parse_args()
     
+    set_seed(args.seed)
+    
     # Validation: need either checkpoint or use_predictions
-    if not args.checkpoint and not args.use_predictions:
+    if not args.checkpoint and not args.use_predictions and not args.mock:
         parser.error("Either --checkpoint or --use_predictions must be provided")
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -385,14 +449,32 @@ def main():
         # When loading from audio files, predictions are always waveforms
         pred_is_waveform = True
     else:
+        
+        # Determine target labels for balanced visualization
+        target_labels = None
+        if args.balanced:
+            if args.core_classes_only:
+                 # 12 classes: 0-11
+                 target_labels = list(range(12))
+            else:
+                 # 35 classes: 0-34
+                 target_labels = list(range(35))
+            
+            # Use exactly one sample per target class
+            args.num_samples = len(target_labels)
+            
         # Generate predictions using model
+        # Create tensor of labels
+        labels_tensor = torch.tensor(target_labels, device=args.device) if target_labels else None
+        
         predictions = load_model_predictions(
             args.checkpoint,
             args.dataset_mode,
             args.pred_mode,
             args.num_samples,
             args.patch_size,
-            args.device
+            args.device,
+            labels=labels_tensor
         )
         predictions = [predictions[i] for i in range(len(predictions))]
         # Model predictions match the dataset_mode
@@ -403,8 +485,12 @@ def main():
         args.data_root,
         args.num_samples,
         dataset_mode=args.dataset_mode,
-        subset=args.subset
+        subset=args.subset,
+        target_labels=target_labels if not args.use_predictions else None,
+        mock=args.mock
     )
+    # Note: If loading predictions from file, we might not know their labels easily unless filenames have them.
+    # For now, only support matched GT loading when generating from model with known labels.
     # Groundtruth format matches the dataset_mode
     gt_is_waveform = (args.dataset_mode == 'raw')
     

@@ -12,7 +12,9 @@ from tqdm import tqdm
 import numpy as np
 
 from dataset import get_dataloader
+from dataset import get_dataloader
 from model import JiT, JiT_models
+from utils import set_seed
 
 
 # --- Exponential Moving Average ---
@@ -452,6 +454,8 @@ def train(args):
     num_classes = 12 if args.core_classes_only else 35
     if args.core_classes_only:
         print(f"Using 12 core classes: yes, no, up, down, left, right, on, off, stop, go, unknown, silence")
+    
+    set_seed(args.seed)
     
     # Dataset
     print(f"Loading dataset: {args.dataset_mode}")
@@ -1021,6 +1025,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     
     # Learning Rate Schedule
     parser.add_argument('--lr_schedule', type=str, default='constant', choices=['constant', 'cosine'],

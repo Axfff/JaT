@@ -12,6 +12,10 @@ from dataset import get_dataloader, denormalize_spectrogram
 import soundfile as sf
 import torchaudio
 
+import sys
+sys.path.append('src') # ensure we can import utils if run from root
+from utils import set_seed
+
 # Monkeypatch torchaudio for speechbrain compatibility
 if not hasattr(torchaudio, 'list_audio_backends'):
     torchaudio.list_audio_backends = lambda: ['soundfile']
@@ -59,7 +63,7 @@ def cfg_schedule(t, s=3.0, tau=0.7, k=10.0):
     return 1.0 + (s - 1.0) * torch.sigmoid(torch.tensor(k * (t - tau)))
 
 
-def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0, use_fp16=True, sampler='euler', num_classes=35, exclude_silence_unknown=False, use_cfg_schedule=False):
+def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred_mode='epsilon', noise_scale=1.0, cfg_scale=1.0, use_fp16=True, sampler='euler', num_classes=35, exclude_silence_unknown=False, use_cfg_schedule=False, labels=None):
     """
     Generate samples using Flow Matching with optional Classifier-Free Guidance.
     
@@ -75,6 +79,7 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
         use_fp16: Whether to use FP16 mixed precision (default: True)
         sampler: Sampling method ('euler' or 'heun')
         use_cfg_schedule: Whether to use time-dependent CFG schedule (default: False)
+        labels: Optional tensor of labels to condition on. If provided, num_samples is ignored (uses labels.shape[0]).
     """
     model.eval()
     
@@ -90,12 +95,22 @@ def sample(model, num_samples, steps=50, device='cuda', dataset_mode='raw', pred
     ts = torch.linspace(0, 1, steps, device=device)
     dt = ts[1] - ts[0]
     
-    # Sample labels - optionally exclude silence (11) and unknown (10)
-    if exclude_silence_unknown and num_classes == 12:
-        # Only sample from 10 core commands (indices 0-9)
-        y = torch.randint(0, 10, (num_samples,), device=device)
+    
+    if labels is not None:
+        y = labels.to(device)
+        num_samples = y.shape[0]
+        # Re-allocate z with correct batch size if needed (though usually caller handles num_samples)
+        if z.shape[0] != num_samples:
+             z = torch.randn((num_samples,) + shape[1:], device=device) * noise_scale
+             t_batch = torch.ones(num_samples, device=device) # just placeholder for inside loop
     else:
-        y = torch.randint(0, num_classes, (num_samples,), device=device)
+        # Sample labels - optionally exclude silence (11) and unknown (10)
+        if exclude_silence_unknown and num_classes == 12:
+            # Only sample from 10 core commands (indices 0-9)
+            y = torch.randint(0, 10, (num_samples,), device=device)
+        else:
+            y = torch.randint(0, num_classes, (num_samples,), device=device)
+    
     
     def compute_velocity(z_in, t_val):
         """Compute velocity at given state and time."""
@@ -286,8 +301,15 @@ if __name__ == "__main__":
     # EMA
     parser.add_argument('--use_ema', action='store_true', default=False,
                         help='Use EMA weights from checkpoint (if available)')
+                        
+    # Evaluation Logic
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--balanced', action='store_true', default=False,
+                        help='Generate 2 samples for each class instead of random sampling')
     
     args = parser.parse_args()
+    
+    set_seed(args.seed)
     
     # Load Model - determine configuration based on dataset_mode
     if args.dataset_mode == 'raw':
@@ -376,6 +398,26 @@ if __name__ == "__main__":
         print(f"Generating samples with static CFG scale={args.cfg_scale}...")
     else:
         print("Generating samples (no CFG)...")
+
+    labels_input = None
+    if args.balanced:
+        # Balanced sampling: 2 samples per class
+        print(f"Balanced sampling: Generating 2 samples for each of {num_classes} classes.")
+        if args.exclude_silence_unknown and num_classes == 12:
+             # 0-9 only
+             classes = list(range(10))
+             print("  (Excluding silence/unknown)")
+        else:
+             classes = list(range(num_classes))
+        
+        # Create label list: [0, 0, 1, 1, ..., N, N]
+        labels_list = []
+        for c in classes:
+            labels_list.extend([c, c])
+        
+        labels_input = torch.tensor(labels_list, device=args.device)
+        args.num_samples = len(labels_list) # Update num_samples to match
+        print(f"  Total samples: {args.num_samples}")
     
     if not args.fp16:
         print("Using FP32 inference (--no-fp16)")
@@ -387,7 +429,8 @@ if __name__ == "__main__":
                     device=args.device, cfg_scale=args.cfg_scale, use_fp16=args.fp16,
                     sampler=args.sampler, num_classes=num_classes,
                     exclude_silence_unknown=args.exclude_silence_unknown,
-                    use_cfg_schedule=args.use_cfg_schedule)
+                    use_cfg_schedule=args.use_cfg_schedule,
+                    labels=labels_input)
     
     save_audio(samples, args.dataset_mode, args.output_dir, device=args.device)
     print(f"Saved to {args.output_dir}")
