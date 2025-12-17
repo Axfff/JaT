@@ -42,7 +42,7 @@ def load_vocoder(device='cuda'):
 
 
 
-def cfg_schedule(t, s=3.0, tau=0.7, k=10.0):
+def cfg_schedule(t, s=2.0, tau=0.7, k=10.0):
     """
     Time-dependent CFG schedule.
     
@@ -53,7 +53,7 @@ def cfg_schedule(t, s=3.0, tau=0.7, k=10.0):
     
     Args:
         t: Current timestep (scalar or tensor), in [0, 1]
-        s: Maximum CFG scale (default: 3.0)
+        s: Maximum CFG scale (default: 2.0)
         tau: Midpoint of the transition (default: 0.7)
         k: Steepness of the sigmoid transition (default: 10.0)
         
